@@ -70,6 +70,7 @@ bash scripts/build_project.sh
 CTRL+C
 
 ## 디렉토리 구조
+```bash
 .
 ├─ models/
 │  ├─ yolo11n-pose.onnx
@@ -85,6 +86,7 @@ CTRL+C
 ├─ README.md
 ├─ SYSTEM_REQUIREMENTS.md
 └─ versions_snapshot.txt
+```
 
 ## 참고
 - Orbbec SDK 경로는 CMake에서 /opt/OrbbecSDK_v2.5.5로 고정되어 있습니다.
