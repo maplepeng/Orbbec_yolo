@@ -1,0 +1,24 @@
+# Build directory
+/build/
+
+# TensorRT engine files (generated locally)
+models/*.engine
+*.engine
+
+# Common build artifacts
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.a
+*.so
+*.out
+
+# Logs
+*.log
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
