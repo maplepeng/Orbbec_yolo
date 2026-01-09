@@ -37,8 +37,8 @@ test -f /opt/OrbbecSDK_v2.5.5/lib/libOrbbecSDK.so \
   || echo "Orbbec SDK missing"
 ```
 
-- 설치 가이드
-./SYSTEM_REQUIREMENTS.md
+- 요구사항 미충족 시
+[설치 가이드](SYSTEM_REQUIREMENTS.md)
 
 2) TensorRT FP16 엔진 생성(ONNX → engine)
 
