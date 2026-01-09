@@ -119,8 +119,7 @@ dpkg -L libnvinfer-bin | grep trtexec || true
 ---
 
 ## 6) Orbbec SDK (installed by .deb)
-[OrbbecSDK_v2](https://github.com/orbbec/OrbbecSDK_v2)
-This project expects Orbbec SDK installed at:
+This project expects [OrbbecSDK_v2](https://github.com/orbbec/OrbbecSDK_v2) installed at:
 - `/opt/OrbbecSDK_v2.5.5`
   - include: `/opt/OrbbecSDK_v2.5.5/include`
   - library: `/opt/OrbbecSDK_v2.5.5/lib/libOrbbecSDK.so`
