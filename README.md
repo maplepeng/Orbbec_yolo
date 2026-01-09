@@ -1,7 +1,5 @@
 # Orbbec YoloPose (Jetson)
 
-git test
-
 Jetson(aarch64)에서 Orbbec 카메라 영상을 입력으로 받아 YOLO11n-pose TensorRT 엔진(FP16)으로 추론하는 C++ 프로젝트입니다.
 
 ## 핵심 정책
