@@ -60,8 +60,7 @@ static void onSigInt(int) {
     g_running.store(false);
 }
 
-// no_gui 모드에서 "q + Enter"로도 종료하고 싶을 때 사용하는 간단 폴링.
-// (터미널 기본이 canonical 모드라 한 글자만으로는 보통 Enter가 필요합니다.)
+// no_gui 모드에서 "q + Enter"로도 종료
 static int pollStdinKeyNonBlocking() {
     fd_set rfds;
     FD_ZERO(&rfds);
@@ -926,34 +925,124 @@ int main(int argc, char** argv) {
         printVideoProfiles("COLOR", color_list);
         printVideoProfiles("DEPTH", depth_list);
 
-        // Prefer MJPG first for color (usually best bandwidth), but allow RGB/BGR fallback.
-        std::vector<OBFormat> color_pref = {OB_FORMAT_MJPG, OB_FORMAT_RGB, OB_FORMAT_BGR};
-        color_profile = pickClosestVideoProfile(color_list, args.color.w, args.color.h, args.color.fps, color_pref, "COLOR");
+        // // Prefer MJPG first for color (usually best bandwidth), but allow RGB/BGR fallback.
+        // // std::vector<OBFormat> color_pref = {OB_FORMAT_MJPG, OB_FORMAT_RGB, OB_FORMAT_BGR};
+        // std::vector<OBFormat> color_pref = {OB_FORMAT_BGR, OB_FORMAT_RGB, OB_FORMAT_MJPG};
+        // color_profile = pickClosestVideoProfile(color_list, args.color.w, args.color.h, args.color.fps, color_pref, "COLOR");
+
+        // if (!color_profile) {
+        //     std::cerr << "No color profile found\n";
+        //     return 1;
+        // }
+
+        // if (args.enable_d2c_align) {
+        //     // Align depth to color using HW D2C (same pattern as Orbbec example)
+        //     cfg->setAlignMode(ALIGN_D2C_HW_MODE);
+
+        //     // Depth profile list compatible with this color profile under HW D2C
+        //     auto d2c_list = pipe->getD2CDepthProfileList(color_profile, ALIGN_D2C_HW_MODE);
+        //     if (d2c_list && d2c_list->getCount() > 0) {
+        //         printVideoProfiles("D2C_DEPTH(HW)", d2c_list);
+        //         std::vector<OBFormat> depth_pref = {OB_FORMAT_Y16};
+        //         depth_profile = pickClosestVideoProfile(d2c_list, args.depth.w, args.depth.h, args.depth.fps, depth_pref, "DEPTH(D2C)");
+        //     } else {
+        //         std::cerr << "[WARN] getD2CDepthProfileList returned empty. Falling back to plain depth list.\n";
+        //         std::vector<OBFormat> depth_pref = {OB_FORMAT_Y16};
+        //         depth_profile = pickClosestVideoProfile(depth_list, args.depth.w, args.depth.h, args.depth.fps, depth_pref, "DEPTH");
+        //     }
+        // } else {
+        //     std::vector<OBFormat> depth_pref = {OB_FORMAT_Y16};
+        //     depth_profile = pickClosestVideoProfile(depth_list, args.depth.w, args.depth.h, args.depth.fps, depth_pref, "DEPTH");
+        // }
+
+        // Color format preference : MJPG > BGR > RGB > YUYV
+        const std::vector<OBFormat> color_pref = {OB_FORMAT_MJPG, OB_FORMAT_BGR, OB_FORMAT_RGB, OB_FORMAT_YUYV};
+
+        // Depth preference (common for Orbbec depth): Y16
+        const std::vector<OBFormat> depth_pref = {OB_FORMAT_Y16};
+
+        // Helper lambda: pick a color profile for a single preferred format.
+        auto pickColorSingleFmt = [&](OBFormat fmt, const char* tag) -> std::shared_ptr<ob::StreamProfile> {
+            std::vector<OBFormat> one = {fmt};
+            return pickClosestVideoProfile(color_list, args.color.w, args.color.h, args.color.fps, one, tag);
+        };
+
+        if (args.enable_d2c_align) {
+            // HW D2C requires a (color, depth) pair that is explicitly supported by the device.
+            // Strategy:
+            //  1) Try color formats in user preference order.
+            //  2) For each color candidate, query D2C-compatible depth profile list (HW).
+            //  3) If non-empty, pick the best depth profile from that list and ONLY THEN enable HW align.
+            //  4) If none works, fall back to "no align" (or change to SW align in your project if available).
+
+            bool hw_d2c_ok = false;
+            std::shared_ptr<ob::StreamProfileList> d2c_list;
+
+            for (OBFormat fmt : color_pref) {
+                auto cand_color = pickColorSingleFmt(fmt, "COLOR(HW_CAND)");
+                if (!cand_color) continue;
+
+                // getD2CDepthProfileList expects a VideoStreamProfile for the color stream.
+                auto cand_color_vp = cand_color->as<ob::VideoStreamProfile>();
+                if (!cand_color_vp) continue;
+
+                auto cand_d2c = pipe->getD2CDepthProfileList(cand_color_vp, ALIGN_D2C_HW_MODE);
+                if (!cand_d2c || cand_d2c->getCount() == 0) {
+                    continue; // try next color format
+                }
+
+                // find a color profile that has at least one HW D2C-compatible depth profile.
+                printVideoProfiles("D2C_DEPTH(HW)", cand_d2c);
+                auto cand_depth = pickClosestVideoProfile(
+                    cand_d2c, args.depth.w, args.depth.h, args.depth.fps,
+                    depth_pref, "DEPTH(D2C_HW)"
+                );
+                if (!cand_depth) {
+                    // Fallback: pick the first compatible depth profile (better than failing hard)
+                    try {
+                        cand_depth = cand_d2c->getProfile(0);
+                    } catch (...) {
+                        cand_depth.reset();
+                    }
+                }
+                if (cand_depth) {
+                    color_profile = cand_color;
+                    depth_profile = cand_depth;
+                    d2c_list = cand_d2c;
+                    hw_d2c_ok = true;
+                    break;
+                }
+            }
+
+            if (hw_d2c_ok) {
+                // IMPORTANT: Only set HW align after (color, depth) pair is confirmed compatible.
+                cfg->setAlignMode(ALIGN_D2C_HW_MODE);
+            } else {
+                std::cerr << "[WARN] No HW D2C-compatible (COLOR, DEPTH) pair found for requested spec. "
+                             "Falling back to non-aligned streams.\n";
+
+                // Disable HW align to avoid: "Current stream profile is not support hardware"
+                // NOTE: Depending on your SDK headers, the disable value may be ALIGN_DISABLE / ALIGN_NONE.
+                cfg->setAlignMode(ALIGN_DISABLE);
+
+                // Now pick best-effort non-aligned streams using the same color preference order.
+                color_profile = pickClosestVideoProfile(color_list, args.color.w, args.color.h, args.color.fps,
+                                                        color_pref, "COLOR");
+                depth_profile = pickClosestVideoProfile(depth_list, args.depth.w, args.depth.h, args.depth.fps,
+                                                        depth_pref, "DEPTH");
+            }
+        } else {
+            // No alignment requested: pick independently.
+            color_profile = pickClosestVideoProfile(color_list, args.color.w, args.color.h, args.color.fps,
+                                                    color_pref, "COLOR");
+            depth_profile = pickClosestVideoProfile(depth_list, args.depth.w, args.depth.h, args.depth.fps,
+                                                    depth_pref, "DEPTH");
+        }
 
         if (!color_profile) {
             std::cerr << "No color profile found\n";
             return 1;
-        }
-
-        if (args.enable_d2c_align) {
-            // Align depth to color using HW D2C (same pattern as Orbbec example)
-            cfg->setAlignMode(ALIGN_D2C_HW_MODE);
-
-            // Depth profile list compatible with this color profile under HW D2C
-            auto d2c_list = pipe->getD2CDepthProfileList(color_profile, ALIGN_D2C_HW_MODE);
-            if (d2c_list && d2c_list->getCount() > 0) {
-                printVideoProfiles("D2C_DEPTH(HW)", d2c_list);
-                std::vector<OBFormat> depth_pref = {OB_FORMAT_Y16};
-                depth_profile = pickClosestVideoProfile(d2c_list, args.depth.w, args.depth.h, args.depth.fps, depth_pref, "DEPTH(D2C)");
-            } else {
-                std::cerr << "[WARN] getD2CDepthProfileList returned empty. Falling back to plain depth list.\n";
-                std::vector<OBFormat> depth_pref = {OB_FORMAT_Y16};
-                depth_profile = pickClosestVideoProfile(depth_list, args.depth.w, args.depth.h, args.depth.fps, depth_pref, "DEPTH");
-            }
-        } else {
-            std::vector<OBFormat> depth_pref = {OB_FORMAT_Y16};
-            depth_profile = pickClosestVideoProfile(depth_list, args.depth.w, args.depth.h, args.depth.fps, depth_pref, "DEPTH");
-        }
+        }     
 
         if (!depth_profile) {
             std::cerr << "No depth profile found\n";
