@@ -13,8 +13,10 @@
 // - CUDA + TensorRT headers/libs available (JetPack)
 //
 // Run example:
-//   ./build/orbbec_yolo_pose ./yolo11n-pose_trt10p3_fp16.engine --rotate=270
-//   ./build/orbbec_yolo_pose ./yolo11n-pose_trt10p3_fp16.engine --color=640x400@30 --depth=640x400@30 --conf=0.25 --nms=0.45
+//   ./build/orbbec_yolo_pose ./models/yolo11n-pose_fp16.engine --rotate=270
+//   ./build/orbbec_yolo_pose ./models/yolo11n-pose_fp16.engine --rotate=270 --no_gui
+//   ./build/orbbec_yolo_pose ./models/yolo11n-pose_fp16.engine --color=640x480@30 --depth=640x480@30 --rotate=270
+//   ./build/orbbec_yolo_pose ./models/yolo11n-pose_fp16.engine --color=640x480@30 --depth=640x480@30 --rotate=270 --no_gui
 
 #include "orbbec_utils.hpp"
 
