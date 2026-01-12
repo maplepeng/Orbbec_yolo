@@ -925,36 +925,6 @@ int main(int argc, char** argv) {
         printVideoProfiles("COLOR", color_list);
         printVideoProfiles("DEPTH", depth_list);
 
-        // // Prefer MJPG first for color (usually best bandwidth), but allow RGB/BGR fallback.
-        // // std::vector<OBFormat> color_pref = {OB_FORMAT_MJPG, OB_FORMAT_RGB, OB_FORMAT_BGR};
-        // std::vector<OBFormat> color_pref = {OB_FORMAT_BGR, OB_FORMAT_RGB, OB_FORMAT_MJPG};
-        // color_profile = pickClosestVideoProfile(color_list, args.color.w, args.color.h, args.color.fps, color_pref, "COLOR");
-
-        // if (!color_profile) {
-        //     std::cerr << "No color profile found\n";
-        //     return 1;
-        // }
-
-        // if (args.enable_d2c_align) {
-        //     // Align depth to color using HW D2C (same pattern as Orbbec example)
-        //     cfg->setAlignMode(ALIGN_D2C_HW_MODE);
-
-        //     // Depth profile list compatible with this color profile under HW D2C
-        //     auto d2c_list = pipe->getD2CDepthProfileList(color_profile, ALIGN_D2C_HW_MODE);
-        //     if (d2c_list && d2c_list->getCount() > 0) {
-        //         printVideoProfiles("D2C_DEPTH(HW)", d2c_list);
-        //         std::vector<OBFormat> depth_pref = {OB_FORMAT_Y16};
-        //         depth_profile = pickClosestVideoProfile(d2c_list, args.depth.w, args.depth.h, args.depth.fps, depth_pref, "DEPTH(D2C)");
-        //     } else {
-        //         std::cerr << "[WARN] getD2CDepthProfileList returned empty. Falling back to plain depth list.\n";
-        //         std::vector<OBFormat> depth_pref = {OB_FORMAT_Y16};
-        //         depth_profile = pickClosestVideoProfile(depth_list, args.depth.w, args.depth.h, args.depth.fps, depth_pref, "DEPTH");
-        //     }
-        // } else {
-        //     std::vector<OBFormat> depth_pref = {OB_FORMAT_Y16};
-        //     depth_profile = pickClosestVideoProfile(depth_list, args.depth.w, args.depth.h, args.depth.fps, depth_pref, "DEPTH");
-        // }
-
         // Color format preference : MJPG > BGR > RGB > YUYV
         const std::vector<OBFormat> color_pref = {OB_FORMAT_MJPG, OB_FORMAT_BGR, OB_FORMAT_RGB, OB_FORMAT_YUYV};
 
