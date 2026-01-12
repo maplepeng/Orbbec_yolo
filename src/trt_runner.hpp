@@ -30,8 +30,14 @@ public:
     ~TrtRunner();
 
     bool ok() const { return ok_; }
+    const std::string& lastError() const { return last_err_; }
     const std::string& inputName() const { return input_name_; }
     const std::string& outputName() const { return output_name_; }
+
+    // Output dims helpers (YOLO11-pose: typically [1,56,8400])
+    const nvinfer1::Dims& outputDims() const { return output_dims_; }
+    int outputC() const;
+    int outputN() const;
 
     int inputW() const { return input_w_; }
     int inputH() const { return input_h_; }
@@ -74,6 +80,7 @@ private:
 
 private:
     bool ok_ = false;
+    std::string last_err_;
 
     Logger logger_;
 
