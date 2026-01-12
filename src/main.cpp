@@ -16,6 +16,8 @@
 //   ./build/orbbec_yolo_pose ./yolo11n-pose_trt10p3_fp16.engine --rotate=270
 //   ./build/orbbec_yolo_pose ./yolo11n-pose_trt10p3_fp16.engine --color=640x400@30 --depth=640x400@30 --conf=0.25 --nms=0.45
 
+#include "orbbec_utils.hpp"
+
 #include <libobsensor/ObSensor.hpp>
 
 #include <NvInfer.h>
@@ -246,99 +248,6 @@ struct RunningStats {
     }
 };
 
-// ----------------------------- Orbbec profile selection -----------------------------
-//
-// “closest profile” heuristic:
-// - strongly prefer matching resolution
-// - then fps
-// - then format (we try to prefer MJPG for color if present, Y16 for depth)
-
-static std::string obFormatToStr(OBFormat f) {
-    // Keep it safe: not all enums are guaranteed; print common ones.
-    switch (f) {
-        case OB_FORMAT_MJPG: return "MJPG";
-        case OB_FORMAT_RGB: return "RGB";
-        case OB_FORMAT_BGR: return "BGR";
-        case OB_FORMAT_YUYV: return "YUYV";
-        case OB_FORMAT_Y16: return "Y16";
-        case OB_FORMAT_NV12: return "NV12";
-        case OB_FORMAT_NV21: return "NV21";
-        default: break;
-    }
-    return "FMT(" + std::to_string(static_cast<int>(f)) + ")";
-}
-
-static void printVideoProfiles(const std::string& title, const std::shared_ptr<ob::StreamProfileList>& list) {
-    std::cout << "\n=== " << title << " profiles (" << list->getCount() << ") ===\n";
-    for (uint32_t i = 0; i < list->getCount(); ++i) {
-        auto p = list->getProfile(i)->as<ob::VideoStreamProfile>();
-        if (!p) continue;
-        std::cout << " [" << i << "] "
-                  << p->getWidth() << "x" << p->getHeight()
-                  << " @" << p->getFps()
-                  << " format=" << obFormatToStr(p->getFormat())
-                  << "\n";
-    }
-}
-
-static std::shared_ptr<ob::StreamProfile> pickClosestVideoProfile(
-    const std::shared_ptr<ob::StreamProfileList>& list,
-    int target_w, int target_h, int target_fps,
-    const std::vector<OBFormat>& preferred_formats,
-    const std::string& tag_for_logs
-) {
-    struct Cand {
-        uint32_t idx;
-        int w, h, fps;
-        OBFormat fmt;
-        double score;
-    };
-
-    std::vector<Cand> cands;
-    cands.reserve(list->getCount());
-
-    for (uint32_t i = 0; i < list->getCount(); ++i) {
-        auto vp = list->getProfile(i)->as<ob::VideoStreamProfile>();
-        if (!vp) continue;
-
-        int w = static_cast<int>(vp->getWidth());
-        int h = static_cast<int>(vp->getHeight());
-        int fps = static_cast<int>(vp->getFps());
-        OBFormat fmt = vp->getFormat();
-
-        // base score: resolution + fps distance
-        double s = 0.0;
-        s += std::abs(w - target_w) * 1000.0;
-        s += std::abs(h - target_h) * 1000.0;
-        s += std::abs(fps - target_fps) * 50.0;
-
-        // format preference penalty
-        if (!preferred_formats.empty()) {
-            auto it = std::find(preferred_formats.begin(), preferred_formats.end(), fmt);
-            if (it == preferred_formats.end()) {
-                // discourage non-preferred format, but don't hard fail
-                s += 1e6;
-            } else {
-                // if multiple preferred formats are listed, earlier is better
-                s += (it - preferred_formats.begin()) * 100.0;
-            }
-        }
-
-        cands.push_back({i, w, h, fps, fmt, s});
-    }
-
-    if (cands.empty()) return nullptr;
-    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b){ return a.score < b.score; });
-
-    const auto& best = cands.front();
-    auto best_p = list->getProfile(best.idx);
-    std::cout << "[ProfilePick][" << tag_for_logs << "] picked idx=" << best.idx
-              << " " << best.w << "x" << best.h << "@" << best.fps
-              << " fmt=" << obFormatToStr(best.fmt)
-              << " (score=" << best.score << ")\n";
-    return best_p;
-}
-
 // ----------------------------- Frame -> cv::Mat converters -----------------------------
 
 static cv::Mat decodeMJPGtoBGR(const uint8_t* data, size_t bytes) {
@@ -385,7 +294,7 @@ static cv::Mat colorFrameToBGR(const std::shared_ptr<ob::ColorFrame>& cf) {
     cv::Mat mj = decodeMJPGtoBGR(data, bytes);
     if (!mj.empty()) return mj;
 
-    std::cerr << "[WARN] Unsupported color format: " << obFormatToStr(fmt)
+    std::cerr << "[WARN] Unsupported color format: " << orbbec_utils::obFormatToStr(fmt)
               << " bytes=" << bytes << " w=" << w << " h=" << h << "\n";
     return {};
 }
@@ -397,7 +306,7 @@ static cv::Mat depthFrameToMat16U(const std::shared_ptr<ob::DepthFrame>& df) {
     auto fmt = df->getFormat();
 
     if (fmt != OB_FORMAT_Y16) {
-        std::cerr << "[WARN] Depth not Y16. fmt=" << obFormatToStr(fmt) << "\n";
+        std::cerr << "[WARN] Depth not Y16. fmt=" << orbbec_utils::obFormatToStr(fmt) << "\n";
         // Try anyway if it is 16-bit
     }
 
@@ -915,117 +824,34 @@ int main(int argc, char** argv) {
     auto cfg = std::make_shared<ob::Config>();
 
     // 3) List all profiles & choose closest
-    std::shared_ptr<ob::StreamProfile> color_profile;
-    std::shared_ptr<ob::StreamProfile> depth_profile;
-
     try {
-        auto color_list = pipe->getStreamProfileList(OB_SENSOR_COLOR);
-        auto depth_list = pipe->getStreamProfileList(OB_SENSOR_DEPTH);
 
-        printVideoProfiles("COLOR", color_list);
-        printVideoProfiles("DEPTH", depth_list);
+        // Frame aggregation: require both color+depth in same frameset (example code behavior)
+        // cfg->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE);
 
-        // Color format preference : MJPG > BGR > RGB > YUYV
-        const std::vector<OBFormat> color_pref = {OB_FORMAT_MJPG, OB_FORMAT_BGR, OB_FORMAT_RGB, OB_FORMAT_YUYV};
 
-        // Depth preference (common for Orbbec depth): Y16
-        const std::vector<OBFormat> depth_pref = {OB_FORMAT_Y16};
 
-        // Helper lambda: pick a color profile for a single preferred format.
-        auto pickColorSingleFmt = [&](OBFormat fmt, const char* tag) -> std::shared_ptr<ob::StreamProfile> {
-            std::vector<OBFormat> one = {fmt};
-            return pickClosestVideoProfile(color_list, args.color.w, args.color.h, args.color.fps, one, tag);
-        };
+        // Stream profile selection + HW D2C compatibility matching is moved to orbbec_utils.
+        // Default color preference: MJPG > BGR > RGB > YUYV, depth: Y16.
+        auto sel = orbbec_utils::configureColorDepthStreams(
+            pipe, cfg,
+            args.color.w, args.color.h, args.color.fps,
+            args.depth.w, args.depth.h, args.depth.fps,
+            args.enable_d2c_align,
+            /*print_lists=*/true
+        );
 
-        if (args.enable_d2c_align) {
-            // HW D2C requires a (color, depth) pair that is explicitly supported by the device.
-            // Strategy:
-            //  1) Try color formats in user preference order.
-            //  2) For each color candidate, query D2C-compatible depth profile list (HW).
-            //  3) If non-empty, pick the best depth profile from that list and ONLY THEN enable HW align.
-            //  4) If none works, fall back to "no align" (or change to SW align in your project if available).
-
-            bool hw_d2c_ok = false;
-            std::shared_ptr<ob::StreamProfileList> d2c_list;
-
-            for (OBFormat fmt : color_pref) {
-                auto cand_color = pickColorSingleFmt(fmt, "COLOR(HW_CAND)");
-                if (!cand_color) continue;
-
-                // getD2CDepthProfileList expects a VideoStreamProfile for the color stream.
-                auto cand_color_vp = cand_color->as<ob::VideoStreamProfile>();
-                if (!cand_color_vp) continue;
-
-                auto cand_d2c = pipe->getD2CDepthProfileList(cand_color_vp, ALIGN_D2C_HW_MODE);
-                if (!cand_d2c || cand_d2c->getCount() == 0) {
-                    continue; // try next color format
-                }
-
-                // find a color profile that has at least one HW D2C-compatible depth profile.
-                printVideoProfiles("D2C_DEPTH(HW)", cand_d2c);
-                auto cand_depth = pickClosestVideoProfile(
-                    cand_d2c, args.depth.w, args.depth.h, args.depth.fps,
-                    depth_pref, "DEPTH(D2C_HW)"
-                );
-                if (!cand_depth) {
-                    // Fallback: pick the first compatible depth profile (better than failing hard)
-                    try {
-                        cand_depth = cand_d2c->getProfile(0);
-                    } catch (...) {
-                        cand_depth.reset();
-                    }
-                }
-                if (cand_depth) {
-                    color_profile = cand_color;
-                    depth_profile = cand_depth;
-                    d2c_list = cand_d2c;
-                    hw_d2c_ok = true;
-                    break;
-                }
-            }
-
-            if (hw_d2c_ok) {
-                // IMPORTANT: Only set HW align after (color, depth) pair is confirmed compatible.
-                cfg->setAlignMode(ALIGN_D2C_HW_MODE);
-            } else {
-                std::cerr << "[WARN] No HW D2C-compatible (COLOR, DEPTH) pair found for requested spec. "
-                             "Falling back to non-aligned streams.\n";
-
-                // Disable HW align to avoid: "Current stream profile is not support hardware"
-                // NOTE: Depending on your SDK headers, the disable value may be ALIGN_DISABLE / ALIGN_NONE.
-                cfg->setAlignMode(ALIGN_DISABLE);
-
-                // Now pick best-effort non-aligned streams using the same color preference order.
-                color_profile = pickClosestVideoProfile(color_list, args.color.w, args.color.h, args.color.fps,
-                                                        color_pref, "COLOR");
-                depth_profile = pickClosestVideoProfile(depth_list, args.depth.w, args.depth.h, args.depth.fps,
-                                                        depth_pref, "DEPTH");
-            }
-        } else {
-            // No alignment requested: pick independently.
-            color_profile = pickClosestVideoProfile(color_list, args.color.w, args.color.h, args.color.fps,
-                                                    color_pref, "COLOR");
-            depth_profile = pickClosestVideoProfile(depth_list, args.depth.w, args.depth.h, args.depth.fps,
-                                                    depth_pref, "DEPTH");
-        }
-
-        if (!color_profile) {
+        if (!sel.color) {
             std::cerr << "No color profile found\n";
             return 1;
-        }     
-
-        if (!depth_profile) {
+        }
+        if (!sel.depth) {
             std::cerr << "No depth profile found\n";
             return 1;
         }
 
-        // Enable streams by StreamProfile (recommended; avoids enableVideoStream signature pitfalls)
-        cfg->enableStream(color_profile);
-        cfg->enableStream(depth_profile);
-
-        // Frame aggregation: require both color+depth in same frameset (example code behavior)
-        cfg->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE);
-
+        // Streams are already enabled in cfg inside configureColorDepthStreams().
+        
         // Enable FrameSync (example code behavior)
         if (args.enable_framesync) {
             pipe->enableFrameSync();

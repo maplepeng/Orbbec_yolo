@@ -39,6 +39,7 @@ set(CMAKE_INSTALL_RPATH "${ORBBEC_ROOT}/lib")
 # ---- Targets ----
 add_executable(orbbec_yolo_pose
   src/main.cpp
+  src/orbbec_utils.cpp
   src/trt_runner.cpp
 )
 
