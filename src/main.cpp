@@ -13,14 +13,15 @@
 // - CUDA + TensorRT headers/libs available (JetPack)
 //
 // Run example:
-//   ./build/orbbec_yolo_pose ./yolo11n-pose_trt10p3_fp16.engine --rotate=270
-//   ./build/orbbec_yolo_pose ./yolo11n-pose_trt10p3_fp16.engine --color=640x400@30 --depth=640x400@30 --conf=0.25 --nms=0.45
+//   ./build/orbbec_yolo_pose ./models/yolo11n-pose_fp16.engine --rotate=270
+//   ./build/orbbec_yolo_pose ./models/yolo11n-pose_fp16.engine --rotate=270 --no_gui
+//   ./build/orbbec_yolo_pose ./models/yolo11n-pose_fp16.engine --color=640x480@30 --depth=640x480@30 --rotate=270
+//   ./build/orbbec_yolo_pose ./models/yolo11n-pose_fp16.engine --color=640x480@30 --depth=640x480@30 --rotate=270 --no_gui
+
+#include "orbbec_utils.hpp"
+#include "trt_runner.hpp"
 
 #include <libobsensor/ObSensor.hpp>
-
-#include <NvInfer.h>
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
 
 #include <opencv2/opencv.hpp>
 
@@ -60,8 +61,7 @@ static void onSigInt(int) {
     g_running.store(false);
 }
 
-// no_gui 모드에서 "q + Enter"로도 종료하고 싶을 때 사용하는 간단 폴링.
-// (터미널 기본이 canonical 모드라 한 글자만으로는 보통 Enter가 필요합니다.)
+// no_gui 모드에서 "q + Enter"로도 종료
 static int pollStdinKeyNonBlocking() {
     fd_set rfds;
     FD_ZERO(&rfds);
@@ -86,45 +86,6 @@ static std::string toLower(std::string s) {
 
 static bool startsWith(const std::string& s, const std::string& p) {
     return s.rfind(p, 0) == 0;
-}
-
-static std::vector<uint8_t> readFileBytes(const std::string& path) {
-    std::ifstream ifs(path, std::ios::binary);
-    if (!ifs) return {};
-    ifs.seekg(0, std::ios::end);
-    size_t n = static_cast<size_t>(ifs.tellg());
-    ifs.seekg(0, std::ios::beg);
-    std::vector<uint8_t> buf(n);
-    if (n) ifs.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(n));
-    return buf;
-}
-
-static size_t dtypeSize(nvinfer1::DataType t) {
-    switch (t) {
-        case nvinfer1::DataType::kFLOAT: return 4;
-        case nvinfer1::DataType::kHALF:  return 2;
-        case nvinfer1::DataType::kINT8:  return 1;
-        case nvinfer1::DataType::kINT32: return 4;
-        case nvinfer1::DataType::kBOOL:  return 1;
-        default: return 0;
-    }
-}
-
-static int64_t volume(const nvinfer1::Dims& d) {
-    int64_t v = 1;
-    for (int i = 0; i < d.nbDims; ++i) v *= d.d[i];
-    return v;
-}
-
-static std::string dimsToStr(const nvinfer1::Dims& d) {
-    std::ostringstream oss;
-    oss << "[";
-    for (int i = 0; i < d.nbDims; ++i) {
-        oss << d.d[i];
-        if (i + 1 < d.nbDims) oss << ", ";
-    }
-    oss << "]";
-    return oss.str();
 }
 
 // ----------------------------- CLI args -----------------------------
@@ -247,99 +208,6 @@ struct RunningStats {
     }
 };
 
-// ----------------------------- Orbbec profile selection -----------------------------
-//
-// “closest profile” heuristic:
-// - strongly prefer matching resolution
-// - then fps
-// - then format (we try to prefer MJPG for color if present, Y16 for depth)
-
-static std::string obFormatToStr(OBFormat f) {
-    // Keep it safe: not all enums are guaranteed; print common ones.
-    switch (f) {
-        case OB_FORMAT_MJPG: return "MJPG";
-        case OB_FORMAT_RGB: return "RGB";
-        case OB_FORMAT_BGR: return "BGR";
-        case OB_FORMAT_YUYV: return "YUYV";
-        case OB_FORMAT_Y16: return "Y16";
-        case OB_FORMAT_NV12: return "NV12";
-        case OB_FORMAT_NV21: return "NV21";
-        default: break;
-    }
-    return "FMT(" + std::to_string(static_cast<int>(f)) + ")";
-}
-
-static void printVideoProfiles(const std::string& title, const std::shared_ptr<ob::StreamProfileList>& list) {
-    std::cout << "\n=== " << title << " profiles (" << list->getCount() << ") ===\n";
-    for (uint32_t i = 0; i < list->getCount(); ++i) {
-        auto p = list->getProfile(i)->as<ob::VideoStreamProfile>();
-        if (!p) continue;
-        std::cout << " [" << i << "] "
-                  << p->getWidth() << "x" << p->getHeight()
-                  << " @" << p->getFps()
-                  << " format=" << obFormatToStr(p->getFormat())
-                  << "\n";
-    }
-}
-
-static std::shared_ptr<ob::StreamProfile> pickClosestVideoProfile(
-    const std::shared_ptr<ob::StreamProfileList>& list,
-    int target_w, int target_h, int target_fps,
-    const std::vector<OBFormat>& preferred_formats,
-    const std::string& tag_for_logs
-) {
-    struct Cand {
-        uint32_t idx;
-        int w, h, fps;
-        OBFormat fmt;
-        double score;
-    };
-
-    std::vector<Cand> cands;
-    cands.reserve(list->getCount());
-
-    for (uint32_t i = 0; i < list->getCount(); ++i) {
-        auto vp = list->getProfile(i)->as<ob::VideoStreamProfile>();
-        if (!vp) continue;
-
-        int w = static_cast<int>(vp->getWidth());
-        int h = static_cast<int>(vp->getHeight());
-        int fps = static_cast<int>(vp->getFps());
-        OBFormat fmt = vp->getFormat();
-
-        // base score: resolution + fps distance
-        double s = 0.0;
-        s += std::abs(w - target_w) * 1000.0;
-        s += std::abs(h - target_h) * 1000.0;
-        s += std::abs(fps - target_fps) * 50.0;
-
-        // format preference penalty
-        if (!preferred_formats.empty()) {
-            auto it = std::find(preferred_formats.begin(), preferred_formats.end(), fmt);
-            if (it == preferred_formats.end()) {
-                // discourage non-preferred format, but don't hard fail
-                s += 1e6;
-            } else {
-                // if multiple preferred formats are listed, earlier is better
-                s += (it - preferred_formats.begin()) * 100.0;
-            }
-        }
-
-        cands.push_back({i, w, h, fps, fmt, s});
-    }
-
-    if (cands.empty()) return nullptr;
-    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b){ return a.score < b.score; });
-
-    const auto& best = cands.front();
-    auto best_p = list->getProfile(best.idx);
-    std::cout << "[ProfilePick][" << tag_for_logs << "] picked idx=" << best.idx
-              << " " << best.w << "x" << best.h << "@" << best.fps
-              << " fmt=" << obFormatToStr(best.fmt)
-              << " (score=" << best.score << ")\n";
-    return best_p;
-}
-
 // ----------------------------- Frame -> cv::Mat converters -----------------------------
 
 static cv::Mat decodeMJPGtoBGR(const uint8_t* data, size_t bytes) {
@@ -386,7 +254,7 @@ static cv::Mat colorFrameToBGR(const std::shared_ptr<ob::ColorFrame>& cf) {
     cv::Mat mj = decodeMJPGtoBGR(data, bytes);
     if (!mj.empty()) return mj;
 
-    std::cerr << "[WARN] Unsupported color format: " << obFormatToStr(fmt)
+    std::cerr << "[WARN] Unsupported color format: " << orbbec_utils::obFormatToStr(fmt)
               << " bytes=" << bytes << " w=" << w << " h=" << h << "\n";
     return {};
 }
@@ -398,7 +266,7 @@ static cv::Mat depthFrameToMat16U(const std::shared_ptr<ob::DepthFrame>& df) {
     auto fmt = df->getFormat();
 
     if (fmt != OB_FORMAT_Y16) {
-        std::cerr << "[WARN] Depth not Y16. fmt=" << obFormatToStr(fmt) << "\n";
+        std::cerr << "[WARN] Depth not Y16. fmt=" << orbbec_utils::obFormatToStr(fmt) << "\n";
         // Try anyway if it is 16-bit
     }
 
@@ -430,300 +298,6 @@ static cv::Mat depthToColorMap(const cv::Mat& depth16, float max_mm) {
     cv::applyColorMap(u8, cm, cv::COLORMAP_JET);
     return cm;
 }
-
-// ----------------------------- Letterbox (YOLO) -----------------------------
-
-struct LetterboxInfo {
-    float scale = 1.f;
-    int pad_x = 0;
-    int pad_y = 0;
-    int in_w = 0, in_h = 0;
-    int out_w = 0, out_h = 0;
-};
-
-static cv::Mat letterboxBGR(const cv::Mat& bgr, int out_w, int out_h, LetterboxInfo& info) {
-    info.in_w = bgr.cols;
-    info.in_h = bgr.rows;
-    info.out_w = out_w;
-    info.out_h = out_h;
-
-    float r = std::min(out_w / (float)info.in_w, out_h / (float)info.in_h);
-    int new_w = (int)std::round(info.in_w * r);
-    int new_h = (int)std::round(info.in_h * r);
-
-    info.scale = r;
-    info.pad_x = (out_w - new_w) / 2;
-    info.pad_y = (out_h - new_h) / 2;
-
-    cv::Mat resized;
-    cv::resize(bgr, resized, cv::Size(new_w, new_h), 0, 0, cv::INTER_LINEAR);
-
-    cv::Mat out(out_h, out_w, CV_8UC3, cv::Scalar(114, 114, 114));
-    resized.copyTo(out(cv::Rect(info.pad_x, info.pad_y, new_w, new_h)));
-    return out;
-}
-
-// Convert BGR (uint8) -> CHW float32 RGB in [0,1]
-static void bgrToCHW_RGB_0to1(const cv::Mat& bgr, int net_w, int net_h, std::vector<float>& out_chw) {
-    cv::Mat rgb;
-    cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
-
-    // Make sure size matches net input
-    cv::Mat resized;
-    if (rgb.cols != net_w || rgb.rows != net_h) {
-        cv::resize(rgb, resized, cv::Size(net_w, net_h), 0, 0, cv::INTER_LINEAR);
-    } else {
-        resized = rgb;
-    }
-
-    out_chw.resize((size_t)3 * net_w * net_h);
-    const int H = net_h, W = net_w;
-    for (int y = 0; y < H; ++y) {
-        const cv::Vec3b* row = resized.ptr<cv::Vec3b>(y);
-        for (int x = 0; x < W; ++x) {
-            const auto& p = row[x]; // RGB
-            out_chw[0 * H * W + y * W + x] = p[0] / 255.0f;
-            out_chw[1 * H * W + y * W + x] = p[1] / 255.0f;
-            out_chw[2 * H * W + y * W + x] = p[2] / 255.0f;
-        }
-    }
-}
-
-// ----------------------------- TensorRT minimal runner (TRT10 enqueueV3) -----------------------------
-
-class TrtLogger : public nvinfer1::ILogger {
-public:
-    void log(Severity severity, const char* msg) noexcept override {
-        if (severity <= Severity::kWARNING) {
-            std::cerr << "[TRT] " << msg << "\n";
-        }
-    }
-};
-
-class TrtEngine {
-public:
-    bool load(const std::string& engine_path) {
-        auto plan = readFileBytes(engine_path);
-        if (plan.empty()) {
-            last_err_ = "cannot open engine file: " + engine_path;
-            return false;
-        }
-
-        runtime_.reset(nvinfer1::createInferRuntime(logger_));
-        if (!runtime_) {
-            last_err_ = "createInferRuntime failed";
-            return false;
-        }
-
-        engine_.reset(runtime_->deserializeCudaEngine(plan.data(), plan.size()));
-        if (!engine_) {
-            last_err_ = "deserializeCudaEngine failed (bad engine / version mismatch)";
-            return false;
-        }
-
-        ctx_.reset(engine_->createExecutionContext());
-        if (!ctx_) {
-            last_err_ = "createExecutionContext failed";
-            return false;
-        }
-
-        // Enumerate IO tensors (TRT10 API)
-        int nb = engine_->getNbIOTensors();
-        if (nb <= 0) {
-            last_err_ = "engine has no IO tensors";
-            return false;
-        }
-
-        io_.clear();
-        io_.reserve(nb);
-
-        for (int i = 0; i < nb; ++i) {
-            const char* name = engine_->getIOTensorName(i);
-            auto mode = engine_->getTensorIOMode(name);
-            auto dtype = engine_->getTensorDataType(name);
-            auto shape = engine_->getTensorShape(name);
-
-            Tensor t;
-            t.name = name;
-            t.is_input = (mode == nvinfer1::TensorIOMode::kINPUT);
-            t.dtype = dtype;
-            t.engine_dims = shape;
-            t.runtime_dims = shape; // will update after setInputShape if dynamic
-            io_.push_back(t);
-        }
-
-        // Identify single input/output for this YOLO model
-        for (auto& t : io_) {
-            if (t.is_input && input_name_.empty()) input_name_ = t.name;
-            if (!t.is_input && output_name_.empty()) output_name_ = t.name;
-        }
-        if (input_name_.empty() || output_name_.empty()) {
-            last_err_ = "failed to identify input/output tensors";
-            return false;
-        }
-
-        // For YOLO11 pose ONNX you showed: input is static [1,3,640,640]
-        // Still, call setInputShape for robustness.
-        auto in_dims = engine_->getTensorShape(input_name_.c_str());
-        if (!ctx_->setInputShape(input_name_.c_str(), in_dims)) {
-            last_err_ = "setInputShape failed";
-            return false;
-        }
-
-        // After shape is set, query runtime shapes and allocate buffers
-        for (auto& t : io_) {
-            t.runtime_dims = ctx_->getTensorShape(t.name.c_str());
-            size_t bytes = (size_t)volume(t.runtime_dims) * dtypeSize(t.dtype);
-            t.bytes = bytes;
-
-            // Allocate device buffer
-            void* dptr = nullptr;
-            cudaError_t ce = cudaMalloc(&dptr, bytes);
-            if (ce != cudaSuccess) {
-                last_err_ = "cudaMalloc failed for tensor " + t.name;
-                return false;
-            }
-            t.dptr = dptr;
-
-            // Bind address
-            if (!ctx_->setTensorAddress(t.name.c_str(), t.dptr)) {
-                last_err_ = "setTensorAddress failed for tensor " + t.name;
-                return false;
-            }
-        }
-
-        // Create stream + events
-        cudaStreamCreate(&stream_);
-        cudaEventCreate(&ev_start_);
-        cudaEventCreate(&ev_end_);
-
-        // Cache net input size (expect NCHW)
-        auto id = ctx_->getTensorShape(input_name_.c_str());
-        // id = [1,3,H,W]
-        input_h_ = (id.nbDims >= 4) ? id.d[2] : 640;
-        input_w_ = (id.nbDims >= 4) ? id.d[3] : 640;
-
-        // Print IO
-        std::cout << "=== Engine I/O tensors ===\n";
-        for (auto& t : io_) {
-            std::cout << (t.is_input ? "INPUT  " : "OUTPUT ")
-                      << t.name
-                      << " dims=" << dimsToStr(t.runtime_dims)
-                      << " bytes=" << t.bytes
-                      << "\n";
-        }
-
-        return true;
-    }
-
-    int inputW() const { return input_w_; }
-    int inputH() const { return input_h_; }
-    const std::string& lastError() const { return last_err_; }
-
-    // Inference:
-    // - takes ORIGINAL BGR frame
-    // - produces output0 float vector (decoded to float regardless of fp16/fp32 output)
-    // - returns GPU enqueue time (ms) measured by CUDA events
-    float inferPose(const cv::Mat& bgr, std::vector<float>& out0, LetterboxInfo* lbinfo_out) {
-        // 1) letterbox to net size
-        LetterboxInfo lb;
-        cv::Mat boxed = letterboxBGR(bgr, input_w_, input_h_, lb);
-        if (lbinfo_out) *lbinfo_out = lb;
-
-        // 2) preprocess -> CHW float RGB [0,1]
-        bgrToCHW_RGB_0to1(boxed, input_w_, input_h_, host_in_);
-
-        // 3) H2D
-        Tensor* tin = findTensor(input_name_);
-        Tensor* tout = findTensor(output_name_);
-        if (!tin || !tout) return 0.f;
-
-        cudaMemcpyAsync(tin->dptr, host_in_.data(), tin->bytes, cudaMemcpyHostToDevice, stream_);
-
-        // 4) enqueueV3
-        cudaEventRecord(ev_start_, stream_);
-        if (!ctx_->enqueueV3(stream_)) {
-            std::cerr << "[TRT] enqueueV3 failed\n";
-            return 0.f;
-        }
-        cudaEventRecord(ev_end_, stream_);
-
-        // 5) D2H output
-        host_out_bytes_.resize(tout->bytes);
-        cudaMemcpyAsync(host_out_bytes_.data(), tout->dptr, tout->bytes, cudaMemcpyDeviceToHost, stream_);
-
-        cudaStreamSynchronize(stream_);
-
-        // 6) convert output to float vector
-        // YOLO11 pose output expected: float32 [1,56,8400] (as you observed via trt_bench)
-        const int64_t out_elems = volume(tout->runtime_dims);
-        out0.resize((size_t)out_elems);
-
-        if (tout->dtype == nvinfer1::DataType::kFLOAT) {
-            std::memcpy(out0.data(), host_out_bytes_.data(), (size_t)out_elems * sizeof(float));
-        } else if (tout->dtype == nvinfer1::DataType::kHALF) {
-            const __half* hp = reinterpret_cast<const __half*>(host_out_bytes_.data());
-            for (int64_t i = 0; i < out_elems; ++i) out0[(size_t)i] = __half2float(hp[i]);
-        } else {
-            std::cerr << "[WARN] Unsupported output dtype for float conversion\n";
-            std::fill(out0.begin(), out0.end(), 0.f);
-        }
-
-        float ms = 0.f;
-        cudaEventElapsedTime(&ms, ev_start_, ev_end_);
-        return ms;
-    }
-
-    ~TrtEngine() {
-        for (auto& t : io_) {
-            if (t.dptr) cudaFree(t.dptr);
-            t.dptr = nullptr;
-        }
-        if (ev_start_) cudaEventDestroy(ev_start_);
-        if (ev_end_) cudaEventDestroy(ev_end_);
-        if (stream_) cudaStreamDestroy(stream_);
-    }
-
-private:
-    struct TRTDeleter {
-        template <typename T>
-        void operator()(T* p) const { if (p) delete p; }
-    };
-
-    // NOTE: In TRT10, these are still returned as raw pointers but are deletable by delete.
-    // On Jetson TRT10, this pattern works in practice.
-    std::unique_ptr<nvinfer1::IRuntime, TRTDeleter> runtime_{nullptr};
-    std::unique_ptr<nvinfer1::ICudaEngine, TRTDeleter> engine_{nullptr};
-    std::unique_ptr<nvinfer1::IExecutionContext, TRTDeleter> ctx_{nullptr};
-
-    struct Tensor {
-        std::string name;
-        bool is_input = false;
-        nvinfer1::DataType dtype{};
-        nvinfer1::Dims engine_dims{};
-        nvinfer1::Dims runtime_dims{};
-        size_t bytes = 0;
-        void* dptr = nullptr;
-    };
-
-    Tensor* findTensor(const std::string& name) {
-        for (auto& t : io_) if (t.name == name) return &t;
-        return nullptr;
-    }
-
-    TrtLogger logger_;
-    std::vector<Tensor> io_;
-    std::string input_name_;
-    std::string output_name_;
-    std::string last_err_;
-
-    cudaStream_t stream_{nullptr};
-    cudaEvent_t ev_start_{nullptr}, ev_end_{nullptr};
-
-    int input_w_ = 640, input_h_ = 640;
-    std::vector<float> host_in_;
-    std::vector<uint8_t> host_out_bytes_;
-};
 
 // ----------------------------- YOLO11 pose decode + draw -----------------------------
 
@@ -773,7 +347,7 @@ static std::vector<Detection> decodeYolo11Pose(
     const std::vector<float>& out,   // [56*8400], layout [C, N]
     int N,                            // 8400
     int img_w, int img_h,             // original image size
-    const LetterboxInfo& lb,
+    const LetterBoxInfo& lb,
     float conf_th,
     int topk
 ) {
@@ -898,8 +472,8 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, onSigInt);
 
     // 1) Load TensorRT engine first (fail fast if engine mismatch)
-    TrtEngine trt;
-    if (!trt.load(args.engine_path)) {
+    TrtRunner trt(args.engine_path);
+    if (!trt.ok()) {
         std::cerr << "TRT init failed: " << trt.lastError() << "\n";
         return 1;
     }
@@ -916,57 +490,28 @@ int main(int argc, char** argv) {
     auto cfg = std::make_shared<ob::Config>();
 
     // 3) List all profiles & choose closest
-    std::shared_ptr<ob::StreamProfile> color_profile;
-    std::shared_ptr<ob::StreamProfile> depth_profile;
-
     try {
-        auto color_list = pipe->getStreamProfileList(OB_SENSOR_COLOR);
-        auto depth_list = pipe->getStreamProfileList(OB_SENSOR_DEPTH);
+        // Stream profile selection + HW D2C compatibility matching is moved to orbbec_utils.
+        // Default color preference: MJPG > BGR > RGB > YUYV, depth: Y16.
+        auto sel = orbbec_utils::configureColorDepthStreams(
+            pipe, cfg,
+            args.color.w, args.color.h, args.color.fps,
+            args.depth.w, args.depth.h, args.depth.fps,
+            args.enable_d2c_align,
+            /*print_lists=*/true
+        );
 
-        printVideoProfiles("COLOR", color_list);
-        printVideoProfiles("DEPTH", depth_list);
-
-        // Prefer MJPG first for color (usually best bandwidth), but allow RGB/BGR fallback.
-        std::vector<OBFormat> color_pref = {OB_FORMAT_MJPG, OB_FORMAT_RGB, OB_FORMAT_BGR};
-        color_profile = pickClosestVideoProfile(color_list, args.color.w, args.color.h, args.color.fps, color_pref, "COLOR");
-
-        if (!color_profile) {
+        if (!sel.color) {
             std::cerr << "No color profile found\n";
             return 1;
         }
-
-        if (args.enable_d2c_align) {
-            // Align depth to color using HW D2C (same pattern as Orbbec example)
-            cfg->setAlignMode(ALIGN_D2C_HW_MODE);
-
-            // Depth profile list compatible with this color profile under HW D2C
-            auto d2c_list = pipe->getD2CDepthProfileList(color_profile, ALIGN_D2C_HW_MODE);
-            if (d2c_list && d2c_list->getCount() > 0) {
-                printVideoProfiles("D2C_DEPTH(HW)", d2c_list);
-                std::vector<OBFormat> depth_pref = {OB_FORMAT_Y16};
-                depth_profile = pickClosestVideoProfile(d2c_list, args.depth.w, args.depth.h, args.depth.fps, depth_pref, "DEPTH(D2C)");
-            } else {
-                std::cerr << "[WARN] getD2CDepthProfileList returned empty. Falling back to plain depth list.\n";
-                std::vector<OBFormat> depth_pref = {OB_FORMAT_Y16};
-                depth_profile = pickClosestVideoProfile(depth_list, args.depth.w, args.depth.h, args.depth.fps, depth_pref, "DEPTH");
-            }
-        } else {
-            std::vector<OBFormat> depth_pref = {OB_FORMAT_Y16};
-            depth_profile = pickClosestVideoProfile(depth_list, args.depth.w, args.depth.h, args.depth.fps, depth_pref, "DEPTH");
-        }
-
-        if (!depth_profile) {
+        if (!sel.depth) {
             std::cerr << "No depth profile found\n";
             return 1;
         }
 
-        // Enable streams by StreamProfile (recommended; avoids enableVideoStream signature pitfalls)
-        cfg->enableStream(color_profile);
-        cfg->enableStream(depth_profile);
-
-        // Frame aggregation: require both color+depth in same frameset (example code behavior)
-        cfg->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE);
-
+        // Streams are already enabled in cfg inside configureColorDepthStreams().
+        
         // Enable FrameSync (example code behavior)
         if (args.enable_framesync) {
             pipe->enableFrameSync();
@@ -1029,16 +574,19 @@ int main(int argc, char** argv) {
         const auto t2 = Clock::now(); // image processed time & infer start
 
         // 5) TensorRT inference
-        LetterboxInfo lb{};
+        LetterBoxInfo lb{};
         std::vector<float> out0;
-        float infer_ms = trt.inferPose(color_bgr, out0, &lb);
+        float infer_ms = trt.infer_pose(color_bgr, out0, lb);
 
         const auto t3 = Clock::now(); // infer end
 
-        // 6) Decode YOLO11 pose output [1,56,8400]
-        // output dims are [1,56,8400] => flatten to [56,8400]
-        // N=8400
-        const int N = 8400;
+        // 6) Decode YOLO11 pose output (typically [1,56,8400])
+        // N is read from the engine output dims when possible.
+        int N = trt.outputN();
+        if (N <= 0) {
+            constexpr int C = 56;
+            N = (out0.size() % C == 0) ? static_cast<int>(out0.size() / C) : 8400;
+        }
         auto cand = decodeYolo11Pose(out0, N, color_bgr.cols, color_bgr.rows, lb, args.conf_th, args.topk);
         auto keep = nms(cand, args.nms_th);
 

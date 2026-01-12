@@ -76,10 +76,11 @@ CTRL+C
 │  ├─ yolo11n-pose.onnx
 ├─ scripts/
 │  ├─ build_engine_fp16.sh
-│  ├─ build_project.sh
-│  └─ check_deps.sh
+│  └─ build_project.sh
 ├─ src/
 │  ├─ main.cpp
+│  ├─ orbbec_utils.cpp
+│  ├─ orbbec_utils.hpp
 │  ├─ trt_runner.cpp
 │  └─ trt_runner.hpp
 ├─ CMakeLists.txt

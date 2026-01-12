@@ -3,6 +3,8 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 
+#include <cuda_fp16.h>
+
 #include <fstream>
 #include <iostream>
 #include <algorithm>
@@ -41,26 +43,30 @@ TrtRunner::TrtRunner(const std::string& engine_path, int input_w, int input_h)
     // 1) 엔진 파일 로드
     auto plan = readFile(engine_path);
     if (plan.empty()) {
-        std::cerr << "TRT init failed: cannot open engine file: " << engine_path << "\n";
+        last_err_ = "cannot open engine file: " + engine_path;
+        std::cerr << "TRT init failed: " << last_err_ << "\n";
         return;
     }
 
     // 2) Runtime/Engine/Context 생성
     runtime_.reset(nvinfer1::createInferRuntime(logger_));
     if (!runtime_) {
-        std::cerr << "TRT init failed: createInferRuntime failed\n";
+        last_err_ = "createInferRuntime failed";
+        std::cerr << "TRT init failed: " << last_err_ << "\n";
         return;
     }
 
     engine_.reset(runtime_->deserializeCudaEngine(plan.data(), plan.size()));
     if (!engine_) {
-        std::cerr << "TRT init failed: deserializeCudaEngine failed (bad engine / version mismatch)\n";
+        last_err_ = "deserializeCudaEngine failed";
+        std::cerr << "TRT init failed: " << last_err_ << "\n";
         return;
     }
 
     ctx_.reset(engine_->createExecutionContext());
     if (!ctx_) {
-        std::cerr << "TRT init failed: createExecutionContext failed\n";
+        last_err_ = "createExecutionContext failed";
+        std::cerr << "TRT init failed: " << last_err_ << "\n";
         return;
     }
 
@@ -73,7 +79,8 @@ TrtRunner::TrtRunner(const std::string& engine_path, int input_w, int input_h)
         if (mode == nvinfer1::TensorIOMode::kOUTPUT) output_name_ = name;
     }
     if (input_name_.empty() || output_name_.empty()) {
-        std::cerr << "TRT init failed: cannot find input/output tensor names\n";
+        last_err_ = "cannot find input/output tensor names";
+        std::cerr << "TRT init failed: " << last_err_ << "\n";
         return;
     }
 
@@ -244,15 +251,26 @@ float TrtRunner::infer_pose(const cv::Mat& bgr, std::vector<float>& out_host_flo
         const float* fp = reinterpret_cast<const float*>(host_output_.data());
         std::copy(fp, fp + out_count, out_host_float.begin());
     } else if (output_dtype_ == nvinfer1::DataType::kHALF) {
-        // 필요 시: fp16 -> fp32 변환
-        // (Jetson 헤더 환경에 따라 cuda_fp16.h 포함이 필요할 수 있으나,
-        //  현재 당신 엔진 로그에선 output fp32로 확인됨)
-        std::cerr << "WARN: output is FP16. Please rebuild engine with FP32 output or add fp16->fp32 conversion.\n";
-        return -1.f;
+        const __half* hp = reinterpret_cast<const __half*>(host_output_.data());
+        for (int64_t i = 0; i < out_count; ++i) {
+            out_host_float[static_cast<size_t>(i)] = __half2float(hp[i]);
+        }
     } else {
         std::cerr << "Unsupported output dtype\n";
         return -1.f;
     }
 
     return ms;
+}
+
+int TrtRunner::outputC() const {
+    // YOLO11-pose: [1,56,8400] => C=56 at dim[1]
+    if (output_dims_.nbDims >= 2) return output_dims_.d[1];
+    return 0;
+}
+
+int TrtRunner::outputN() const {
+    // YOLO11-pose: [1,56,8400] => N=8400 at last dim
+    if (output_dims_.nbDims >= 1) return output_dims_.d[output_dims_.nbDims - 1];
+    return 0;
 }
