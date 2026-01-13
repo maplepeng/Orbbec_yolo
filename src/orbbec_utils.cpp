@@ -230,4 +230,63 @@ SelectedStreams configureColorDepthStreams(
     );
 }
 
+HwNoiseRemovalResult tryConfigureHwNoiseRemoval(
+    const std::shared_ptr<ob::Pipeline>& pipe,
+    bool enable,
+    float threshold,
+    bool verbose
+) {
+    HwNoiseRemovalResult r;
+    if (!pipe) {
+        if (verbose) std::cerr << "[HWNoise] pipeline is null (skip)\n";
+        return r;
+    }
+
+    try {
+        auto dev = pipe->getDevice();
+        if (!dev) {
+            if (verbose) std::cerr << "[HWNoise] device is null (skip)\n";
+            return r;
+        }
+
+        // Property IDs are defined by Orbbec SDK v2. If unsupported on the current device/firmware,
+        // isPropertySupported() will return false and we simply skip.
+        const auto kEnableProp = OB_PROP_HW_NOISE_REMOVE_FILTER_ENABLE_BOOL;
+        const auto kThreshProp = OB_PROP_HW_NOISE_REMOVE_FILTER_THRESHOLD_FLOAT;
+
+        if (!dev->isPropertySupported(kEnableProp, OB_PERMISSION_WRITE)) {
+            if (verbose) std::cerr << "[HWNoise] not supported on this device/firmware\n";
+            return r;
+        }
+        r.supported = true;
+
+        dev->setBoolProperty(kEnableProp, enable);
+        r.enabled = enable;
+
+        if (enable && dev->isPropertySupported(kThreshProp, OB_PERMISSION_WRITE)) {
+            dev->setFloatProperty(kThreshProp, threshold);
+            r.threshold = threshold;
+        }
+
+        if (verbose) {
+            if (r.enabled) {
+                std::cerr << "[HWNoise] enabled";
+                if (r.threshold > 0.0f) std::cerr << " (threshold=" << r.threshold << ")";
+                std::cerr << "\n";
+            } else {
+                std::cerr << "[HWNoise] disabled\n";
+            }
+        }
+    } catch (const ob::Error& e) {
+        if (verbose) {
+           std::cerr << "[HWNoise][WARN] Orbbec error: " << e.getMessage()
+                      << " (type=" << e.getExceptionType() << ")\n";
+        }
+    } catch (const std::exception& e) {
+        if (verbose) std::cerr << "[HWNoise][WARN] exception: " << e.what() << "\n";
+    }
+
+    return r;
+}
+
 } // namespace orbbec_utils
