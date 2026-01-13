@@ -650,6 +650,11 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (cap_stats.n <= 100) {
+        std::cout << "\n"
+            << "Max and Min values are calculated afer the 100th frame.";
+    }
+ 
     std::cout << "\n"
         << "= SUMMARY =" << "\n"
         << "total frame : " << cap_stats.n << "| GUI : " << args.GUI <<"\n"
