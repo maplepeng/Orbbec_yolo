@@ -58,12 +58,20 @@ bash scripts/build_project.sh
 
 - GUI ON
 ```bash
-./build/orbbec_yolo_pose ./models/yolo11n-pose_fp16.engine --rotate=270
+bash scripts/2L.sh
+bash scripts/336L.sh
 ```
 
 - GUI OFF
 ```bash
-./build/orbbec_yolo_pose ./models/yolo11n-pose_fp16.engine --rotate=270 --no_gui
+bash scripts/2L.sh --no_gui
+bash scripts/336L.sh --no_gui
+```
+
+- Cycle time check
+```bash
+bash scripts/2L.sh --time
+bash scripts/336L.sh --time
 ```
 
 - 종료
@@ -75,6 +83,8 @@ CTRL+C
 ├─ models/
 │  ├─ yolo11n-pose.onnx
 ├─ scripts/
+│  ├─ 2L.sh
+│  ├─ 336L.sh
 │  ├─ build_engine_fp16.sh
 │  └─ build_project.sh
 ├─ src/

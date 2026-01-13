@@ -119,9 +119,13 @@ struct Args {
     Spec depth{640, 400, 30}; // default: 640x400
     int rotate = 0;           // 0/90/180/270
     bool GUI = true; 
+    bool time_check = false;
 
     bool enable_framesync = true;
     bool enable_d2c_align = true;  // use HW D2C align
+    bool enable_hw_noise = true;   // enable on-device depth denoise if supported
+    float hw_noise_thresh = 0.2f;  // hardware noise removal threshold
+
     float conf_th = 0.25f;
     float nms_th = 0.45f;
     float kpt_th = 0.25f;
@@ -140,9 +144,12 @@ static void printUsage(const char* prog) {
         << "  --color=640x400@30        Color target (default 640x400@30)\n"
         << "  --depth=640x400@30        Depth target (default 640x400@30)\n"
         << "  --rotate=0|90|180|270     Rotate BOTH color/depth for display+inference (default 0)\n"
-        << "  --no_gui                  Disable GUI (default enabled)\n"
+        << "  --no_gui                  Disable GUI (default: enabled)\n"
+        << "  --time                    Enable logging process time (default: disable)\n"
         << "  --no_sync                 Disable FrameSync (default: enabled)\n"
         << "  --no_align                Disable D2C align (default: enabled HW align)\n"
+        << "  --no_hw_noise             Disable HW depth noise removal (default: enabled if supported)\n"
+        << "  --hw_noise_thresh=0.2     HW noise removal threshold (default 0.2)\n"
         << "  --conf=0.25               Detection confidence threshold\n"
         << "  --nms=0.45                NMS IoU threshold\n"
         << "  --kpt=0.25                Keypoint confidence threshold\n"
@@ -167,10 +174,16 @@ static bool parseArgs(int argc, char** argv, Args& a) {
             a.GUI = true;
         } else if (s == "--no_gui") {
             a.GUI = false;
+        } else if (s == "--time") {
+            a.time_check = true;
         } else if (s == "--no_sync") {
             a.enable_framesync = false;
         } else if (s == "--no_align") {
             a.enable_d2c_align = false;
+        } else if (s == "--no_hw_noise") {
+            a.enable_hw_noise = false;
+        } else if (startsWith(s, "--hw_noise_thresh=")) {
+            a.hw_noise_thresh = std::stof(s.substr(17));
         } else if (startsWith(s, "--conf=")) {
             a.conf_th = std::stof(s.substr(7));
         } else if (startsWith(s, "--nms=")) {
@@ -489,6 +502,10 @@ int main(int argc, char** argv) {
 
     auto cfg = std::make_shared<ob::Config>();
 
+    // Optional: enable Orbbec on-device (hardware) depth noise removal when supported.
+    // Per Orbbec docs, this is available on Gemini 330 series with firmware >= 1.4.60.
+    (void)orbbec_utils::tryConfigureHwNoiseRemoval(pipe, args.enable_hw_noise, args.hw_noise_thresh, true);
+
     // 3) List all profiles & choose closest
     try {
         // Stream profile selection + HW D2C compatibility matching is moved to orbbec_utils.
@@ -624,14 +641,22 @@ int main(int argc, char** argv) {
         infer_stats.add(infer_ms);
         loop_stats.add(loop_ms);
 
-        std::cout << "capture=" << std::fixed << std::setprecision(1) << capture_ms << " ms,";
-        std::cout << "img_process=" << std::fixed << std::setprecision(1) << total_img_ms << " ms,";
-        std::cout << "infer=" << std::fixed << std::setprecision(1) << infer_ms << " ms,";
-        std::cout << "infer_process=" << std::fixed << std::setprecision(1) << infer_process_ms << " ms,";
-        std::cout << "loop=" << std::fixed << std::setprecision(1) << loop_ms << " ms\n";
+        if (args.time_check == true) {
+            std::cout << "capture=" << std::fixed << std::setprecision(1) << capture_ms << " ms,";
+            std::cout << "img_process=" << std::fixed << std::setprecision(1) << total_img_ms << " ms,";
+            std::cout << "infer=" << std::fixed << std::setprecision(1) << infer_ms << " ms,";
+            std::cout << "infer_process=" << std::fixed << std::setprecision(1) << infer_process_ms << " ms,";
+            std::cout << "loop=" << std::fixed << std::setprecision(1) << loop_ms << " ms\n";
+        }
     }
 
+    if (cap_stats.n <= 100) {
+        std::cout << "\n"
+            << "Max and Min values are calculated afer the 100th frame.";
+    }
+ 
     std::cout << "\n"
+        << "= SUMMARY =" << "\n"
         << "total frame : " << cap_stats.n << "| GUI : " << args.GUI <<"\n"
         << "capture_mean=" << std::fixed << std::setprecision(1) << cap_stats.mean
         << " ms, capture_min=" << std::fixed << std::setprecision(1) << cap_stats.min << " ms\n"
