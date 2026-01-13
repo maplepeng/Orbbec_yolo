@@ -51,4 +51,21 @@ SelectedStreams configureColorDepthStreams(
     const std::vector<OBFormat>& depth_pref
 );
 
+// Result of trying to enable Orbbec on-device (hardware) depth noise removal.
+// Supported on Gemini 330 series (firmware >= 1.4.60) per Orbbec docs.
+struct HwNoiseRemovalResult {
+    bool supported = false;
+    bool enabled = false;
+    float threshold = 0.0f;
+};
+
+// Try to enable/disable the hardware noise removal filter if the connected device supports it.
+// Safe to call on any device: it checks property support first and logs a one-line summary.
+HwNoiseRemovalResult tryConfigureHwNoiseRemoval(
+    const std::shared_ptr<ob::Pipeline>& pipe,
+    bool enable,
+    float threshold,
+    bool verbose = true
+);
+
 } // namespace orbbec_utils
