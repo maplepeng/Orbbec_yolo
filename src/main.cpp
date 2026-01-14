@@ -553,6 +553,29 @@ int main(int argc, char** argv) {
 
     RunningStats cap_stats, infer_stats, loop_stats;
 
+    // Print device + calibration once (actual streaming profiles + depth scale)
+    bool printed_cam_internal = false;
+    while (printed_cam_internal == false) {
+        std::shared_ptr<ob::FrameSet> fs;
+        try {
+            fs = pipe->waitForFrameset(100);
+        } catch (const ob::Error& e) {
+            std::cerr << "waitForFrameset error: " << e.getMessage() << "\n";
+            continue;
+        }
+        if (!fs) continue;
+
+        auto c = fs->colorFrame();
+        auto d = fs->depthFrame();
+        if (!c || !d) continue;
+
+        orbbec_utils::printDeviceInfo(pipe);
+        const auto ci = orbbec_utils::getCameraInternalFromFrameset(fs);
+        orbbec_utils::printCameraInternal(ci, /*print_distortion=*/true, /*print_extrinsic=*/true);
+        printed_cam_internal = true;
+    }
+
+    // Main loop start
     while (g_running.load()) {
         const auto t0 = Clock::now(); // start time
 

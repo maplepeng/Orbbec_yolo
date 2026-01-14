@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <iomanip>
+#include <sstream>
+#include <type_traits>
+#include <utility>
 
 namespace orbbec_utils {
 
@@ -289,4 +293,227 @@ HwNoiseRemovalResult tryConfigureHwNoiseRemoval(
     return r;
 }
 
+// ---------------------- Camera internal parameters helpers ----------------------
+namespace {
+
+template <typename T, typename = void>
+struct has_name_method : std::false_type {};
+template <typename T>
+struct has_name_method<T, std::void_t<decltype(std::declval<T*>()->name())>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_getName_method : std::false_type {};
+template <typename T>
+struct has_getName_method<T, std::void_t<decltype(std::declval<T*>()->getName())>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_serialNumber_method : std::false_type {};
+template <typename T>
+struct has_serialNumber_method<T, std::void_t<decltype(std::declval<T*>()->serialNumber())>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_getSerialNumber_method : std::false_type {};
+template <typename T>
+struct has_getSerialNumber_method<T, std::void_t<decltype(std::declval<T*>()->getSerialNumber())>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_firmwareVersion_method : std::false_type {};
+template <typename T>
+struct has_firmwareVersion_method<T, std::void_t<decltype(std::declval<T*>()->firmwareVersion())>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_getFirmwareVersion_method : std::false_type {};
+template <typename T>
+struct has_getFirmwareVersion_method<T, std::void_t<decltype(std::declval<T*>()->getFirmwareVersion())>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_connectionType_method : std::false_type {};
+template <typename T>
+struct has_connectionType_method<T, std::void_t<decltype(std::declval<T*>()->connectionType())>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_getConnectionType_method : std::false_type {};
+template <typename T>
+struct has_getConnectionType_method<T, std::void_t<decltype(std::declval<T*>()->getConnectionType())>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_member_fx : std::false_type {};
+template <typename T>
+struct has_member_fx<T, std::void_t<decltype(std::declval<T>().fx)>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_member_k1 : std::false_type {};
+template <typename T>
+struct has_member_k1<T, std::void_t<decltype(std::declval<T>().k1)>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_member_rot : std::false_type {};
+template <typename T>
+struct has_member_rot<T, std::void_t<decltype(std::declval<T>().rot)>> : std::true_type {};
+
+static void printIntrinsic(const OBCameraIntrinsic& K, const char* tag) {
+    std::cout << "  - " << tag << " intrinsic: ";
+    if constexpr (has_member_fx<OBCameraIntrinsic>::value) {
+        std::cout << "w=" << K.width << " h=" << K.height
+                  << " fx=" << K.fx << " fy=" << K.fy
+                  << " cx=" << K.cx << " cy=" << K.cy << "\n";
+    } else {
+        std::cout << "(layout unknown in this SDK)\n";
+    }
+}
+
+static void printDistortion(const OBCameraDistortion& D, const char* tag) {
+    std::cout << "  - " << tag << " distortion: ";
+    if constexpr (has_member_k1<OBCameraDistortion>::value) {
+        std::cout << "k1=" << D.k1 << " k2=" << D.k2
+                  << " p1=" << D.p1 << " p2=" << D.p2
+                  << " k3=" << D.k3 << " k4=" << D.k4
+                  << " k5=" << D.k5 << " k6=" << D.k6 << "\n";
+    } else {
+        std::cout << "(layout unknown in this SDK)\n";
+    }
+}
+
+static void printExtrinsic(const OBExtrinsic& E, const char* tag) {
+    std::cout << "  - " << tag << " extrinsic (R|t): ";
+    if constexpr (has_member_rot<OBExtrinsic>::value) {
+        // rot is 3x3 row-major, trans is 3x1 (meters)
+        std::cout << "t=[" << E.trans[0] << ", " << E.trans[1] << ", " << E.trans[2] << "] "
+                  << "R=[" << E.rot[0] << " " << E.rot[1] << " " << E.rot[2] << "; "
+                          << E.rot[3] << " " << E.rot[4] << " " << E.rot[5] << "; "
+                          << E.rot[6] << " " << E.rot[7] << " " << E.rot[8] << "]\n";
+    } else {
+        std::cout << "(layout unknown in this SDK)\n";
+    }
+}
+
+} // anonymous namespace
+
+float getDepthValueScaleSafe(const std::shared_ptr<ob::DepthFrame>& depth) {
+    if (!depth) return 0.0f;
+    try {
+        return depth->getValueScale();
+    } catch (...) {
+        return 0.0f;
+    }
+}
+
+CameraInternal getCameraInternalFromFrameset(const std::shared_ptr<ob::FrameSet>& fs) {
+    CameraInternal out{};
+    if (!fs) return out;
+
+    try {
+        auto c = fs->colorFrame();
+        auto d = fs->depthFrame();
+        if (!c || !d) return out;
+
+        out.depth_value_scale = getDepthValueScaleSafe(d);
+
+        auto c_vp = c->getStreamProfile()->as<ob::VideoStreamProfile>();
+        auto d_vp = d->getStreamProfile()->as<ob::VideoStreamProfile>();
+        if (c_vp) {
+            out.color_intr  = c_vp->getIntrinsic();
+            out.color_dist  = c_vp->getDistortion();
+            out.has_color   = true;
+        }
+        if (d_vp) {
+            out.depth_intr  = d_vp->getIntrinsic();
+            out.depth_dist  = d_vp->getDistortion();
+            out.has_depth   = true;
+        }
+        if (c_vp && d_vp) {
+            out.depth_to_color = d_vp->getExtrinsicTo(c_vp);
+            out.has_extrinsic_d2c = true;
+        }
+    } catch (...) {
+        // best-effort: leave flags as-is
+    }
+
+    return out;
+}
+
+void printDeviceInfo(const std::shared_ptr<ob::Pipeline>& pipe) {
+    if (!pipe) {
+        std::cout << "[CamInfo] pipeline=null\n";
+        return;
+    }
+    try {
+        auto dev = pipe->getDevice();
+        if (!dev) {
+            std::cout << "[CamInfo] device=null\n";
+            return;
+        }
+        auto info = dev->getDeviceInfo();
+        if (!info) {
+            std::cout << "[CamInfo] deviceInfo=null\n";
+            return;
+        }
+
+        using InfoT = std::remove_reference_t<decltype(*info)>;
+
+        std::ostringstream oss;
+        oss << "[CamInfo] Device";
+        if constexpr (has_name_method<InfoT>::value) {
+            oss << " name=" << info->name();
+        } else if constexpr (has_getName_method<InfoT>::value) {
+            oss << " name=" << info->getName();
+        }
+
+        if constexpr (has_serialNumber_method<InfoT>::value) {
+            oss << " sn=" << info->serialNumber();
+        } else if constexpr (has_getSerialNumber_method<InfoT>::value) {
+            oss << " sn=" << info->getSerialNumber();
+        }
+
+        if constexpr (has_firmwareVersion_method<InfoT>::value) {
+            oss << " fw=" << info->firmwareVersion();
+        } else if constexpr (has_getFirmwareVersion_method<InfoT>::value) {
+            oss << " fw=" << info->getFirmwareVersion();
+        }
+
+        if constexpr (has_connectionType_method<InfoT>::value) {
+            oss << " conn=" << info->connectionType();
+        } else if constexpr (has_getConnectionType_method<InfoT>::value) {
+            oss << " conn=" << info->getConnectionType();
+        }
+
+        std::cout << oss.str() << "\n";
+    } catch (const ob::Error& e) {
+        std::cout << "[CamInfo][WARN] Orbbec error: " << e.getMessage() << "\n";
+    } catch (const std::exception& e) {
+        std::cout << "[CamInfo][WARN] exception: " << e.what() << "\n";
+    }
+}
+
+void printCameraInternal(const CameraInternal& ci,
+                         bool print_distortion,
+                         bool print_extrinsic) {
+    std::cout << "[CamInfo] Calibration (from current streaming profiles)\n";
+    if (ci.depth_value_scale > 0.0f) {
+        std::cout << "  - depth value scale: " << std::fixed << std::setprecision(6)
+                  << ci.depth_value_scale << " (meters per raw unit)\n";
+    } else {
+        std::cout << "  - depth value scale: (unavailable)\n";
+    }
+
+    if (ci.has_color) {
+        printIntrinsic(ci.color_intr, "color");
+        if (print_distortion) printDistortion(ci.color_dist, "color");
+    } else {
+        std::cout << "  - color intrinsic: (unavailable)\n";
+    }
+
+    if (ci.has_depth) {
+        printIntrinsic(ci.depth_intr, "depth");
+        if (print_distortion) printDistortion(ci.depth_dist, "depth");
+    } else {
+        std::cout << "  - depth intrinsic: (unavailable)\n";
+    }
+
+    if (print_extrinsic && ci.has_extrinsic_d2c) {
+        printExtrinsic(ci.depth_to_color, "depth->color");
+    } else if (print_extrinsic) {
+        std::cout << "  - depth->color extrinsic: (unavailable)\n";
+    }
+}
 } // namespace orbbec_utils
