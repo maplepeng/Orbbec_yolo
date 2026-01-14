@@ -312,6 +312,65 @@ static cv::Mat depthToColorMap(const cv::Mat& depth16, float max_mm) {
     return cm;
 }
 
+// =======================
+// Camera intrinsics cache + keypoint->XYZ helper
+// =======================
+struct CamInternal {
+    bool ready = false;
+    OBCameraIntrinsic color_intr{};
+    float depth_value_scale = 0.0f; // typically mm/LSB on Orbbec
+};
+
+static inline cv::Point2f unrotatePixelToOrig(const cv::Point2f& p_rot, int rotate_deg, int orig_w, int orig_h) {
+    // Inverse mapping for rotateIfNeeded() that uses OpenCV rotate.
+    // rotate_deg: 0/90/180/270 where 90 is CW and 270 is CCW.
+    const float xr = p_rot.x;
+    const float yr = p_rot.y;
+    if (rotate_deg == 0) {
+        return p_rot;
+    } else if (rotate_deg == 90) {
+        // Inverse of (x' = H-1-y, y' = x)
+        return cv::Point2f(yr, (float)(orig_h - 1) - xr);
+    } else if (rotate_deg == 180) {
+        return cv::Point2f((float)(orig_w - 1) - xr, (float)(orig_h - 1) - yr);
+    } else if (rotate_deg == 270) {
+        // Inverse of (x' = y, y' = W-1-x)
+        return cv::Point2f((float)(orig_w - 1) - yr, xr);
+    }
+    return p_rot;
+}
+
+static bool keypointToXYZ(const CamInternal& ci,
+                          const cv::Mat& depth16_rot,
+                          const cv::Point2f& p_rot,
+                          int rotate_deg,
+                          int orig_w, int orig_h,
+                          float& X, float& Y, float& Z,
+                          uint16_t& raw_depth) {
+    if (!ci.ready) return false;
+    if (depth16_rot.empty() || depth16_rot.type() != CV_16UC1) return false;
+
+    // Depth lookup in the CURRENT (rotated) depth image (aligned to current color when D2C succeeded)
+    const int u = (int)std::lround(p_rot.x);
+    const int v = (int)std::lround(p_rot.y);
+    if (u < 0 || u >= depth16_rot.cols || v < 0 || v >= depth16_rot.rows) return false;
+
+    raw_depth = depth16_rot.at<uint16_t>(v, u);
+    if (raw_depth == 0) return false; // invalid
+
+    // Convert raw depth to meters.
+    // Orbbec commonly provides depth in millimeters with scale=1.0; treat scale as mm/LSB.
+    const float z_mm = raw_depth * ci.depth_value_scale;
+    Z = z_mm * 0.001f;
+
+    // Use ORIGINAL (unrotated) pixel coordinates for projection with intrinsic.
+    const cv::Point2f p_orig = unrotatePixelToOrig(p_rot, rotate_deg, orig_w, orig_h);
+
+    X = (p_orig.x - ci.color_intr.cx) / ci.color_intr.fx * Z;
+    Y = (p_orig.y - ci.color_intr.cy) / ci.color_intr.fy * Z;
+    return true;
+}
+
 // ----------------------------- YOLO11 pose decode + draw -----------------------------
 
 struct Detection {
@@ -552,10 +611,10 @@ int main(int argc, char** argv) {
     };
 
     RunningStats cap_stats, infer_stats, loop_stats;
+    CamInternal cam{};
 
     // Print device + calibration once (actual streaming profiles + depth scale)
-    bool printed_cam_internal = false;
-    while (printed_cam_internal == false) {
+    while (!cam.ready) {
         std::shared_ptr<ob::FrameSet> fs;
         try {
             fs = pipe->waitForFrameset(100);
@@ -569,10 +628,17 @@ int main(int argc, char** argv) {
         auto d = fs->depthFrame();
         if (!c || !d) continue;
 
+        cv::Mat color_bgr = colorFrameToBGR(c);
+        if (color_bgr.empty()) continue;
+
         orbbec_utils::printDeviceInfo(pipe);
         const auto ci = orbbec_utils::getCameraInternalFromFrameset(fs);
         orbbec_utils::printCameraInternal(ci, /*print_distortion=*/true, /*print_extrinsic=*/true);
-        printed_cam_internal = true;
+        
+        // Cache camera intrinsics / depth scale once (needed for keypoint->XYZ)
+        cam.depth_value_scale = ci.depth_value_scale;
+        cam.color_intr = ci.color_intr;
+        cam.ready = true;
     }
 
     // Main loop start
@@ -629,6 +695,31 @@ int main(int argc, char** argv) {
         }
         auto cand = decodeYolo11Pose(out0, N, color_bgr.cols, color_bgr.rows, lb, args.conf_th, args.topk);
         auto keep = nms(cand, args.nms_th);
+
+        // keep[*].kpt[*] coordinates are in the current color_bgr frame coordinates (after rotate).
+        if (!keep.empty()) {
+            const int k = 0;
+            if (k >= 0 && k < 17) {
+                const float kc = keep[0].kpt_conf[k];
+                const cv::Point2f& uv = keep[0].kpt[k];
+                if (kc >= args.kpt_th) {
+                    float X, Y, Z;
+                    uint16_t raw = 0;
+                    if (keypointToXYZ(cam, depth16, uv, args.rotate, args.color.w, args.color.h, X, Y, Z, raw)) {
+                        std::cout << "[XYZ] |"
+                                  << " kpt=" << k
+                                  << " conf=" << kc
+                                  << " uv_rot=(" << uv.x << "," << uv.y << ")"
+                                  << " XYZ_m=(" << X << "," << Y << "," << Z << ")" << std::endl;
+                    } else {
+                        std::cout << "[XYZ] |"
+                                  << " kpt=" << k
+                                  << " conf=" << kc
+                                  << " uv_rot=(" << uv.x << "," << uv.y << ") invalid depth (raw=0 or OOB)" << std::endl;
+                    }
+                }
+            }
+        }
 
         int key = -1;
         if (args.GUI == true) {
