@@ -533,6 +533,8 @@ static void drawPose(
 // ----------------------------- Main -----------------------------
 
 int main(int argc, char** argv) {
+    bool debug = false;
+
     Args args;
     if (!parseArgs(argc, argv, args)) {
         printUsage(argv[0]);
@@ -697,25 +699,27 @@ int main(int argc, char** argv) {
         auto keep = nms(cand, args.nms_th);
 
         // keep[*].kpt[*] coordinates are in the current color_bgr frame coordinates (after rotate).
-        if (!keep.empty()) {
-            const int k = 0;
-            if (k >= 0 && k < 17) {
-                const float kc = keep[0].kpt_conf[k];
-                const cv::Point2f& uv = keep[0].kpt[k];
-                if (kc >= args.kpt_th) {
-                    float X, Y, Z;
-                    uint16_t raw = 0;
-                    if (keypointToXYZ(cam, depth16, uv, args.rotate, args.color.w, args.color.h, X, Y, Z, raw)) {
-                        std::cout << "[XYZ] |"
-                                  << " kpt=" << k
-                                  << " conf=" << kc
-                                  << " uv_rot=(" << uv.x << "," << uv.y << ")"
-                                  << " XYZ_m=(" << X << "," << Y << "," << Z << ")" << std::endl;
-                    } else {
-                        std::cout << "[XYZ] |"
-                                  << " kpt=" << k
-                                  << " conf=" << kc
-                                  << " uv_rot=(" << uv.x << "," << uv.y << ") invalid depth (raw=0 or OOB)" << std::endl;
+        if (debug == true) {
+            if (!keep.empty()) {
+                const int k = 0;
+                if (k >= 0 && k < 17) {
+                    const float kc = keep[0].kpt_conf[k];
+                    const cv::Point2f& uv = keep[0].kpt[k];
+                    if (kc >= args.kpt_th) {
+                        float X, Y, Z;
+                        uint16_t raw = 0;
+                        if (keypointToXYZ(cam, depth16, uv, args.rotate, args.color.w, args.color.h, X, Y, Z, raw)) {
+                            std::cout << "[XYZ] |"
+                                    << " kpt=" << k
+                                    << " conf=" << kc
+                                    << " uv_rot=(" << uv.x << "," << uv.y << ")"
+                                    << " XYZ_m=(" << X << "," << Y << "," << Z << ")" << std::endl;
+                        } else {
+                            std::cout << "[XYZ] |"
+                                    << " kpt=" << k
+                                    << " conf=" << kc
+                                    << " uv_rot=(" << uv.x << "," << uv.y << ") invalid depth (raw=0 or OOB)" << std::endl;
+                        }
                     }
                 }
             }
