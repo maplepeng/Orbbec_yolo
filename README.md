@@ -1,11 +1,11 @@
-# Orbbec YoloPose (Jetson)
+# Orbbec Pose (Jetson)
 
-Jetson(aarch64)에서 Orbbec 카메라 영상을 입력으로 받아 YOLO11n-pose TensorRT 엔진(FP16)으로 추론하는 C++ 프로젝트입니다.
+Jetson(aarch64)에서 Orbbec 카메라 영상을 입력으로 받아 TensorRT 엔진(FP16)으로 인체 2D 스켈레톤 추론하는 C++ 프로젝트입니다.
 
 ## 핵심 정책
 - CUDA / TensorRT / OpenCV / Orbbec SDK는 Jetson 시스템(=JetPack) 설치를 전제합니다.
-- `models/*.onnx`는 repo에 포함합니다.
-- `models/*.engine`은 Jetson에서 로컬로 생성하며 repo에 커밋하지 않습니다.
+- Jetson에서 `*.onnx`를 `.engine`를 로컬로 변환하여 사용합니다.
+- RTMdet/RTMpose onnx 파일은 용량이 커 repo에 포함하지 않습니다.
 
 ## 빠른 시작 (Jetson)
 1) 시스템 요구사항 확인  
@@ -45,7 +45,16 @@ test -f /opt/OrbbecSDK_v2.5.5/lib/libOrbbecSDK.so \
 ```bash
 cd ~/Orbbec_yolo
 chmod +x scripts/*.sh
+```
+
+- YOLO11n-pose TensorRT engine 변환
+```bash
 bash scripts/build_engine_fp16.sh models/yolo11n-pose.onnx models/yolo11n-pose_fp16.engine
+```
+
+- RTMdet-s + RTMpose-s TensorRT engine 변환
+```bash
+bash scripts/build_rtm_engine.sh
 ```
 
 3) 빌드

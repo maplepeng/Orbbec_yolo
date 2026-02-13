@@ -3,7 +3,8 @@
 
 # onnx/TensorRT engine files (generated locally)
 models/engine/*.engine
-models/onnx/
+models/onnx/mmdet_rtmdet
+models/onnx/mmpose_halpe26
 
 # Common build artifacts
 CMakeFiles/
