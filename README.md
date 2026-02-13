@@ -90,12 +90,15 @@ CTRL+C
 ```bash
 .
 ├─ models/
-│  ├─ yolo11n-pose.onnx
+│  ├─ engine/
+│  └─ onnx/
+│     └─ yolo11n-pose.onnx
 ├─ scripts/
 │  ├─ 2L.sh
 │  ├─ 336L.sh
 │  ├─ build_engine_fp16.sh
-│  └─ build_project.sh
+│  ├─ build_project.sh
+│  └─ build_rtm_engine.sh
 ├─ src/
 │  ├─ main.cpp
 │  ├─ orbbec_utils.cpp
