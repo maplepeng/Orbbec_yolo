@@ -1,9 +1,9 @@
 # Build directory
 /build/
 
-# TensorRT engine files (generated locally)
-models/*.engine
-*.engine
+# onnx/TensorRT engine files (generated locally)
+models/engine/*.engine
+models/onnx/
 
 # Common build artifacts
 CMakeFiles/

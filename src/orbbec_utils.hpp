@@ -68,4 +68,36 @@ HwNoiseRemovalResult tryConfigureHwNoiseRemoval(
     bool verbose = true
 );
 
+// ---------------------- Camera internal parameters helpers ----------------------
+struct CameraInternal {
+    bool has_color = false;
+    bool has_depth = false;
+    bool has_extrinsic_d2c = false;
+
+    OBCameraIntrinsic  color_intr{};
+    OBCameraDistortion color_dist{};
+    OBCameraIntrinsic  depth_intr{};
+    OBCameraDistortion depth_dist{};
+    OBExtrinsic        depth_to_color{};
+
+    // Depth value scale: z_meters = raw * depth_value_scale
+    float depth_value_scale = 0.0f;
+};
+
+// Extract intrinsics/distortion/extrinsic and depth value scale from an actual frameset.
+// This reflects the profiles currently streaming (resolution/FPS/format and D2C choice).
+CameraInternal getCameraInternalFromFrameset(const std::shared_ptr<ob::FrameSet>& fs);
+
+// Convenience: read depth value scale (returns 0.0 on failure).
+float getDepthValueScaleSafe(const std::shared_ptr<ob::DepthFrame>& depth);
+
+// Print device info (model/SN/FW if available) in a best-effort way.
+// Implemented with compile-time detection to tolerate SDK API differences.
+void printDeviceInfo(const std::shared_ptr<ob::Pipeline>& pipe);
+
+// Print camera internal parameters.
+void printCameraInternal(const CameraInternal& ci,
+                         bool print_distortion = true,
+                         bool print_extrinsic = true);
+
 } // namespace orbbec_utils
