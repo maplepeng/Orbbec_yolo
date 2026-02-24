@@ -383,7 +383,56 @@ struct PersonDet {
     bool yolo_gate_pass = true;
     std::array<cv::Point2f, 17> yolo_kpt{};
     std::array<float, 17> yolo_kpt_conf{};
+    float depth_mm = -1.0f;
 };
+
+static float robustTorsoDepthMm(const PersonDet& det, const cv::Mat& depth16, float quantile = 0.65f) {
+    if (depth16.empty() || depth16.type() != CV_16UC1) return -1.0f;
+
+    const float w = std::max(1.0f, det.x2 - det.x1);
+    const float h = std::max(1.0f, det.y2 - det.y1);
+
+    // Torso-focused ROI to reduce foreground occluder bias from limbs/edges.
+    const float rx1 = det.x1 + 0.35f * w;
+    const float rx2 = det.x1 + 0.65f * w;
+    const float ry1 = det.y1 + 0.25f * h;
+    const float ry2 = det.y1 + 0.70f * h;
+
+    const int x1 = std::max(0, static_cast<int>(std::floor(rx1)));
+    const int y1 = std::max(0, static_cast<int>(std::floor(ry1)));
+    const int x2 = std::min(depth16.cols - 1, static_cast<int>(std::ceil(rx2)));
+    const int y2 = std::min(depth16.rows - 1, static_cast<int>(std::ceil(ry2)));
+    if (x2 <= x1 || y2 <= y1) return -1.0f;
+
+    const int roi_w = x2 - x1 + 1;
+    const int roi_h = y2 - y1 + 1;
+    const int roi_area = roi_w * roi_h;
+
+    // Grid sampling to cap depth collection cost while keeping stable statistics.
+    constexpr int target_samples = 400;
+    int sample_step = 1;
+    if (roi_area > target_samples) {
+        sample_step = static_cast<int>(std::floor(std::sqrt(static_cast<float>(roi_area) / target_samples)));
+        sample_step = std::max(1, std::min(sample_step, 8));
+    }
+
+    std::vector<uint16_t> vals;
+    vals.reserve(static_cast<size_t>(roi_area / (sample_step * sample_step) + 4));
+    for (int y = y1; y <= y2; y += sample_step) {
+        const uint16_t* row = depth16.ptr<uint16_t>(y);
+        for (int x = x1; x <= x2; x += sample_step) {
+            const uint16_t d = row[x];
+            if (d > 0) vals.push_back(d);
+        }
+    }
+    if (vals.size() < 20U) return -1.0f;
+
+    quantile = clampf(quantile, 0.50f, 0.90f);
+    size_t qi = static_cast<size_t>(std::floor(quantile * static_cast<float>(vals.size() - 1)));
+    if (qi >= vals.size()) qi = vals.size() - 1;
+    std::nth_element(vals.begin(), vals.begin() + static_cast<std::ptrdiff_t>(qi), vals.end());
+    return static_cast<float>(vals[qi]);
+}
 
 struct PoseResult {
     PersonDet det;
@@ -391,6 +440,7 @@ struct PoseResult {
     std::vector<cv::Point2f> kpt;
     std::vector<float> kpt_conf;
     float pose_mean_conf = 0.0f;
+    float depth_mm = -1.0f;
 };
 
 static float iou(const PersonDet& a, const PersonDet& b) {
@@ -895,6 +945,11 @@ static void drawPose(cv::Mat& bgr,
             << " yk:" << r.det.yolo_high_kpt_count
             << " ye:" << r.det.yolo_edge_kpt_count
             << " p:" << std::fixed << std::setprecision(2) << r.pose_mean_conf;
+        if (r.depth_mm > 0.0f) {
+            oss << " z:" << std::fixed << std::setprecision(0) << r.depth_mm;
+        } else {
+            oss << " z:NA";
+        }
         cv::putText(bgr,
                     oss.str(),
                     cv::Point(static_cast<int>(r.det.x1), static_cast<int>(std::max(0.0f, r.det.y1 - 5))),
@@ -935,6 +990,11 @@ static void drawPose(cv::Mat& bgr,
         oss << "YOLO-only d:" << std::fixed << std::setprecision(2) << d.conf
             << " yk:" << d.yolo_high_kpt_count
             << " ye:" << d.yolo_edge_kpt_count;
+        if (d.depth_mm > 0.0f) {
+            oss << " z:" << std::fixed << std::setprecision(0) << d.depth_mm;
+        } else {
+            oss << " z:NA";
+        }
         cv::putText(bgr,
                     oss.str(),
                     cv::Point(static_cast<int>(d.x1), static_cast<int>(std::max(0.0f, d.y1 - 5))),
@@ -1101,21 +1161,54 @@ int main(int argc, char** argv) {
                                         args.yolo_edge_kpt_min_count);
         auto keep = nms(cand, args.yolo_nms_th);
 
-        std::vector<PersonDet> pose_inputs;
-        pose_inputs.reserve(static_cast<size_t>(args.max_person));
         std::vector<PersonDet> yolo_only;
         yolo_only.reserve(keep.size());
+        std::vector<PersonDet> pose_candidates;
+        pose_candidates.reserve(keep.size());
 
-        for (const auto& det : keep) {
+        for (const auto& det_in : keep) {
+            PersonDet det = det_in;
+            det.depth_mm = robustTorsoDepthMm(det, depth16);
+
             if (!det.yolo_gate_pass) {
-                yolo_only.push_back(det);
+                yolo_only.push_back(std::move(det));
                 continue;
             }
-            if (static_cast<int>(pose_inputs.size()) >= args.max_person) {
-                yolo_only.push_back(det);
-                continue;
+            pose_candidates.push_back(std::move(det));
+        }
+
+        struct PoseCandidate {
+            PersonDet det;
+            float rank_depth_mm = -1.0f;
+            bool depth_valid = false;
+        };
+
+        std::vector<PoseCandidate> ranked;
+        ranked.reserve(pose_candidates.size());
+        for (const auto& det : pose_candidates) {
+            PoseCandidate c;
+            c.det = det;
+            c.rank_depth_mm = c.det.depth_mm;
+            c.depth_valid = (c.rank_depth_mm > 0.0f);
+            ranked.push_back(std::move(c));
+        }
+
+        std::sort(ranked.begin(), ranked.end(), [](const PoseCandidate& a, const PoseCandidate& b) {
+            if (a.depth_valid != b.depth_valid) return a.depth_valid > b.depth_valid;
+            if (a.depth_valid && b.depth_valid && std::fabs(a.rank_depth_mm - b.rank_depth_mm) > 1e-3f) {
+                return a.rank_depth_mm < b.rank_depth_mm;  // closer first
             }
-            pose_inputs.push_back(det);
+            return a.det.conf > b.det.conf;  // fallback
+        });
+
+        std::vector<PersonDet> pose_inputs;
+        pose_inputs.reserve(static_cast<size_t>(args.max_person));
+        for (size_t i = 0; i < ranked.size(); ++i) {
+            if (static_cast<int>(i) < args.max_person) {
+                pose_inputs.push_back(ranked[i].det);
+            } else {
+                yolo_only.push_back(ranked[i].det);
+            }
         }
 
         std::vector<PoseResult> results;
@@ -1150,6 +1243,7 @@ int main(int argc, char** argv) {
                 for (float s : r.kpt_conf) sum += s;
                 r.pose_mean_conf = sum / static_cast<float>(r.kpt_conf.size());
             }
+            r.depth_mm = robustTorsoDepthMm(r.det, depth16);
             results.push_back(std::move(r));
         }
 
