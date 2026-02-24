@@ -13,3 +13,4 @@ cmake --build "${BUILD_DIR}" -j
 
 echo "[DONE] Binaries:"
 ls -lh "${BUILD_DIR}/orbbec_yolo_pose" 2>/dev/null || true
+ls -lh "${BUILD_DIR}/orbbec_rtm_pose" 2>/dev/null || true
