@@ -38,7 +38,7 @@ set(CMAKE_INSTALL_RPATH "${ORBBEC_ROOT}/lib")
 
 # ---- Targets ----
 add_executable(orbbec_yolo_pose
-  src/main.cpp
+  src/main_yolo.cpp
   src/orbbec_utils.cpp
   src/trt_runner.cpp
 )
@@ -50,6 +50,27 @@ target_include_directories(orbbec_yolo_pose PRIVATE
 )
 
 target_link_libraries(orbbec_yolo_pose PRIVATE
+  ${OpenCV_LIBS}
+  Threads::Threads
+  ${ORBBEC_LIB}
+  ${NVINFER_LIB}
+  ${NVINFER_PLUGIN_LIB}
+  CUDA::cudart
+)
+
+add_executable(orbbec_rtm_pose
+  src/main_rtm.cpp
+  src/orbbec_utils.cpp
+  src/trt_runner_multi.cpp
+)
+
+target_include_directories(orbbec_rtm_pose PRIVATE
+  ${OpenCV_INCLUDE_DIRS}
+  ${ORBBEC_INCLUDE_DIR}
+  ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(orbbec_rtm_pose PRIVATE
   ${OpenCV_LIBS}
   Threads::Threads
   ${ORBBEC_LIB}
