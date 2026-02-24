@@ -97,7 +97,7 @@ bash scripts/336L.sh --time
 - GUI / time은 위와 동일 방식
 
 - YOLO11n-pose에서 nose(0), wrists(9,10), ankles(15,16) 인식될 시 RTMpose-s로 전달
-(기본: `--yolo_edge_kpt_min_count=5`)
+(기본: `--yolo_edge_kpt_min_count=5`, `--person_expand=1.10`)
 ```bash
 bash scripts/rtm.sh
 ```

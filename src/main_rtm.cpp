@@ -112,7 +112,7 @@ struct Args {
 
     int topk = 50;
     int max_person = 3;
-    float person_expand = 1.25f;
+    float person_expand = 1.10f;
 
     float depth_max_mm = 4000.0f;
 };
@@ -128,7 +128,7 @@ static void printUsage(const char* prog) {
         << "  --color=640x400@30                    (default 640x400@30)\n"
         << "  --depth=640x400@30                    (default 640x400@30)\n"
         << "  --rotate=0|90|180|270                 (default 0)\n"
-        << "  --conf=0.25                           YOLOpose confidence threshold\n"
+        << "  --conf=0.50                           YOLOpose confidence threshold\n"
         << "  --nms=0.45                            YOLOpose NMS IoU threshold\n"
         << "  --yolo_kpt_conf=0.25                  YOLO keypoint confidence threshold for gate\n"
         << "  --yolo_kpt_min_count=0                Min # of YOLO keypoints above threshold (0=disable)\n"
@@ -138,7 +138,7 @@ static void printUsage(const char* prog) {
         << "  --topk=50                             Keep top-K candidates before NMS\n"
         << "  --kpt=0.25                            Keypoint confidence threshold\n"
         << "  --max_person=3                        Max persons to run RTMPose\n"
-        << "  --person_expand=1.25                  BBox expansion factor for top-down crop\n"
+        << "  --person_expand=1.10                  BBox expansion factor for top-down crop\n"
         << "  --no_gui                              Disable GUI\n"
         << "  --time                                Enable timing logs\n"
         << "  --no_sync | --no_align | --no_hw_noise\n"
@@ -164,9 +164,9 @@ static bool parseArgs(int argc, char** argv, Args& a) {
         } else if (startsWith(s, "--pose_input=")) {
             if (!parseWH(s.substr(13), a.pose_input_w, a.pose_input_h)) return false;
         } else if (startsWith(s, "--color=")) {
-            parseWHFps(s.substr(8), a.color);
+            if (!parseWHFps(s.substr(8), a.color)) return false;
         } else if (startsWith(s, "--depth=")) {
-            parseWHFps(s.substr(8), a.depth);
+            if (!parseWHFps(s.substr(8), a.depth)) return false;
         } else if (startsWith(s, "--rotate=")) {
             a.rotate = std::stoi(s.substr(9));
         } else if (s == "--gui") {
@@ -247,6 +247,8 @@ struct RunningStats {
             if (x > max) max = x;
         }
     }
+
+    bool hasExtrema() const { return n > 100; }
 };
 
 static cv::Mat decodeMJPGtoBGR(const uint8_t* data, size_t bytes) {
@@ -386,7 +388,7 @@ struct PersonDet {
     float depth_mm = -1.0f;
 };
 
-static float robustTorsoDepthMm(const PersonDet& det, const cv::Mat& depth16, float quantile = 0.65f) {
+static float robustTorsoDepthMm(const PersonDet& det, const cv::Mat& depth16, float depth_value_scale, float quantile = 0.65f) {
     if (depth16.empty() || depth16.type() != CV_16UC1) return -1.0f;
 
     const float w = std::max(1.0f, det.x2 - det.x1);
@@ -431,11 +433,13 @@ static float robustTorsoDepthMm(const PersonDet& det, const cv::Mat& depth16, fl
     size_t qi = static_cast<size_t>(std::floor(quantile * static_cast<float>(vals.size() - 1)));
     if (qi >= vals.size()) qi = vals.size() - 1;
     std::nth_element(vals.begin(), vals.begin() + static_cast<std::ptrdiff_t>(qi), vals.end());
-    return static_cast<float>(vals[qi]);
+    const float scale = (depth_value_scale > 0.0f) ? depth_value_scale : 1.0f;
+    return static_cast<float>(vals[qi]) * scale;
 }
 
 struct PoseResult {
     PersonDet det;
+    cv::Rect2f expanded_box;
     cv::Rect2f pose_box;
     std::vector<cv::Point2f> kpt;
     std::vector<float> kpt_conf;
@@ -505,11 +509,22 @@ static cv::Point2f invYoloLetterbox(float x, float y, int img_w, int img_h, cons
     return cv::Point2f(ox, oy);
 }
 
-static cv::Rect2f makePoseBox(const PersonDet& d, int img_w, int img_h, float padding, float aspect_w_over_h) {
+static cv::Rect2f makeExpandedBox(const PersonDet& d, float padding) {
     const float cx = (d.x1 + d.x2) * 0.5f;
     const float cy = (d.y1 + d.y2) * 0.5f;
     float bw = std::max(1.0f, d.x2 - d.x1) * padding;
     float bh = std::max(1.0f, d.y2 - d.y1) * padding;
+
+    float x = cx - bw * 0.5f;
+    float y = cy - bh * 0.5f;
+    return cv::Rect2f(x, y, bw, bh);
+}
+
+static cv::Rect2f makePoseBox(const cv::Rect2f& expanded_box, int img_w, int img_h, float aspect_w_over_h) {
+    const float cx = expanded_box.x + expanded_box.width * 0.5f;
+    const float cy = expanded_box.y + expanded_box.height * 0.5f;
+    float bw = std::max(1.0f, expanded_box.width);
+    float bh = std::max(1.0f, expanded_box.height);
 
     // Match MMPose TopDownGetBboxCenterScale aspect adjustment.
     if (bw > aspect_w_over_h * bh) {
@@ -932,13 +947,17 @@ static void drawPose(cv::Mat& bgr,
                       cv::Scalar(0, 255, 0),
                       2);
 
-        // RTMPose affine input box (TopDownGetBboxCenterScale + aspect-adjusted box)
-        cv::rectangle(bgr,
-                      cv::Rect(cv::Point(static_cast<int>(r.pose_box.x), static_cast<int>(r.pose_box.y)),
-                               cv::Point(static_cast<int>(r.pose_box.x + r.pose_box.width),
-                                         static_cast<int>(r.pose_box.y + r.pose_box.height))),
-                      cv::Scalar(0, 255, 255),
-                      2);
+        // Draw only expanded ROI (1.10 right after expansion). RTM aspect-adjusted box is hidden.
+        const cv::Rect2f img_bounds(0.0f, 0.0f, static_cast<float>(bgr.cols), static_cast<float>(bgr.rows));
+        const cv::Rect2f pose_vis = r.expanded_box & img_bounds;
+        if (pose_vis.width > 1.0f && pose_vis.height > 1.0f) {
+            cv::rectangle(bgr,
+                          cv::Rect(cv::Point(static_cast<int>(pose_vis.x), static_cast<int>(pose_vis.y)),
+                                   cv::Point(static_cast<int>(pose_vis.x + pose_vis.width),
+                                             static_cast<int>(pose_vis.y + pose_vis.height))),
+                          cv::Scalar(0, 255, 255),
+                          2);
+        }
 
         std::ostringstream oss;
         oss << "d:" << std::fixed << std::setprecision(2) << r.det.conf
@@ -1168,7 +1187,7 @@ int main(int argc, char** argv) {
 
         for (const auto& det_in : keep) {
             PersonDet det = det_in;
-            det.depth_mm = robustTorsoDepthMm(det, depth16);
+            det.depth_mm = robustTorsoDepthMm(det, depth16, cam.depth_value_scale);
 
             if (!det.yolo_gate_pass) {
                 yolo_only.push_back(std::move(det));
@@ -1217,7 +1236,8 @@ int main(int argc, char** argv) {
         float pose_sum_ms = 0.0f;
         for (const auto& det : pose_inputs) {
             const float aspect = static_cast<float>(args.pose_input_w) / static_cast<float>(args.pose_input_h);
-            const cv::Rect2f pose_box = makePoseBox(det, color_bgr.cols, color_bgr.rows, args.person_expand, aspect);
+            const cv::Rect2f expanded_box = makeExpandedBox(det, args.person_expand);
+            const cv::Rect2f pose_box = makePoseBox(expanded_box, color_bgr.cols, color_bgr.rows, aspect);
             if (pose_box.width <= 1.0f || pose_box.height <= 1.0f) continue;
 
             std::vector<float> pose_input;
@@ -1233,6 +1253,7 @@ int main(int argc, char** argv) {
 
             PoseResult r;
             r.det = det;
+            r.expanded_box = expanded_box;
             r.pose_box = pose_box;
             if (!decodeRTMPose(pose_runner, args.pose_input_w, args.pose_input_h, Minv, r.kpt, r.kpt_conf)) {
                 yolo_only.push_back(det);
@@ -1243,7 +1264,7 @@ int main(int argc, char** argv) {
                 for (float s : r.kpt_conf) sum += s;
                 r.pose_mean_conf = sum / static_cast<float>(r.kpt_conf.size());
             }
-            r.depth_mm = robustTorsoDepthMm(r.det, depth16);
+            r.depth_mm = det.depth_mm;
             results.push_back(std::move(r));
         }
 
@@ -1318,20 +1339,27 @@ int main(int argc, char** argv) {
         std::cout << "\nMax and Min values are calculated after the 100th frame.";
     }
 
+    auto formatExtrema = [](const RunningStats& s, bool want_min) -> std::string {
+        if (!s.hasExtrema()) return "N/A";
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(1) << (want_min ? s.min : s.max);
+        return oss.str();
+    };
+
     std::cout << "\n= SUMMARY =\n"
               << "total frame : " << cap_stats.n << "| GUI : " << args.GUI << "\n"
               << "capture_mean=" << std::fixed << std::setprecision(1) << cap_stats.mean
-              << " ms, capture_min=" << std::fixed << std::setprecision(1) << cap_stats.min << " ms\n"
+              << " ms, capture_min=" << formatExtrema(cap_stats, true) << " ms\n"
               << "yolo_infer_mean=" << std::fixed << std::setprecision(1) << yolo_infer_stats.mean
-              << " ms, yolo_infer_max=" << std::fixed << std::setprecision(1) << yolo_infer_stats.max << " ms\n"
+              << " ms, yolo_infer_max=" << formatExtrema(yolo_infer_stats, false) << " ms\n"
               << "rtm_infer_mean=" << std::fixed << std::setprecision(1) << rtm_infer_stats.mean
-              << " ms, rtm_infer_max=" << std::fixed << std::setprecision(1) << rtm_infer_stats.max << " ms\n"
+              << " ms, rtm_infer_max=" << formatExtrema(rtm_infer_stats, false) << " ms\n"
               << "infer_process_mean=" << std::fixed << std::setprecision(1) << infer_process_stats.mean
-              << " ms, infer_process_max=" << std::fixed << std::setprecision(1) << infer_process_stats.max << " ms\n"
+              << " ms, infer_process_max=" << formatExtrema(infer_process_stats, false) << " ms\n"
               << "pose_per_person_mean=" << std::fixed << std::setprecision(1) << pose_per_person_stats.mean
-              << " ms, pose_per_person_max=" << std::fixed << std::setprecision(1) << pose_per_person_stats.max << " ms\n"
+              << " ms, pose_per_person_max=" << formatExtrema(pose_per_person_stats, false) << " ms\n"
               << "loop_mean=" << std::fixed << std::setprecision(1) << loop_stats.mean
-              << " ms, loop_max=" << std::fixed << std::setprecision(1) << loop_stats.max << " ms\n";
+              << " ms, loop_max=" << formatExtrema(loop_stats, false) << " ms\n";
 
     try {
         pipe->stop();

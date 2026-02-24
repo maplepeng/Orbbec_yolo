@@ -10,6 +10,7 @@ DEFAULT_ARGS=(
   "--rotate=270"
   "--yolo_kpt_min_count=0"
   "--yolo_edge_kpt_min_count=5"
+  "--person_expand=1.10"
 )
 
 exec "$BIN" "${DEFAULT_ARGS[@]}" "$@"
