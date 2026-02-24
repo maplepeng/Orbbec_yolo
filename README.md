@@ -49,7 +49,7 @@ chmod +x scripts/*.sh
 
 - YOLO11n-pose TensorRT engine 변환
 ```bash
-bash scripts/build_engine_fp16.sh models/yolo11n-pose.onnx models/yolo11n-pose_fp16.engine
+bash scripts/build_engine_fp16.sh models/onnx/yolo11n-pose.onnx models/engine/yolo11n-pose_fp16.engine
 ```
 
 - RTMdet-s + RTMpose-s TensorRT engine 변환
@@ -57,13 +57,23 @@ bash scripts/build_engine_fp16.sh models/yolo11n-pose.onnx models/yolo11n-pose_f
 bash scripts/build_rtm_engine.sh
 ```
 
+- RTMPose-s TensorRT engine만 변환
+```bash
+bash scripts/build_rtmpose_engine.sh
+```
+
 3) 빌드
 
 ```bash
 bash scripts/build_project.sh
 ```
+(`orbbec_yolo_pose`, `orbbec_rtm_pose` 둘 다 빌드)
 
 4) 실행 예시
+
+(1) YOLO11n-pose 인식 스크립트 실행
+- 2L : HW noise removal OFF
+- 336L : HW noise removal ON
 
 - GUI ON
 ```bash
@@ -83,6 +93,15 @@ bash scripts/2L.sh --time
 bash scripts/336L.sh --time
 ```
 
+(2) YOLO11n-pose -> RTMpose-s 인식 스크립트 실행
+- GUI / time은 위와 동일 방식
+
+- YOLO11n-pose에서 nose(0), wrists(9,10), ankles(15,16) 인식될 시 RTMpose-s로 전달
+(기본: `--yolo_edge_kpt_min_count=5`)
+```bash
+bash scripts/rtm.sh
+```
+
 - 종료
 CTRL+C
 
@@ -91,20 +110,26 @@ CTRL+C
 .
 ├─ models/
 │  ├─ engine/
+│  │  └─ .gitkeep
 │  └─ onnx/
 │     └─ yolo11n-pose.onnx
 ├─ scripts/
 │  ├─ 2L.sh
 │  ├─ 336L.sh
+│  ├─ rtm.sh
 │  ├─ build_engine_fp16.sh
 │  ├─ build_project.sh
-│  └─ build_rtm_engine.sh
+│  ├─ build_rtm_engine.sh
+│  └─ build_rtmpose_engine.sh
 ├─ src/
-│  ├─ main.cpp
+│  ├─ main_yolo.cpp
+│  ├─ main_rtm.cpp
 │  ├─ orbbec_utils.cpp
 │  ├─ orbbec_utils.hpp
 │  ├─ trt_runner.cpp
-│  └─ trt_runner.hpp
+│  ├─ trt_runner.hpp
+│  ├─ trt_runner_multi.cpp
+│  └─ trt_runner_multi.hpp
 ├─ CMakeLists.txt
 ├─ README.md
 ├─ SYSTEM_REQUIREMENTS.md

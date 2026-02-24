@@ -1029,7 +1029,7 @@ int main(int argc, char** argv) {
         return std::chrono::duration<double, std::milli>(b - a).count();
     };
 
-    RunningStats cap_stats, infer_stats, loop_stats;
+    RunningStats cap_stats, yolo_infer_stats, rtm_infer_stats, infer_process_stats, pose_per_person_stats, loop_stats;
     CamInternal cam{};
 
     while (!cam.ready) {
@@ -1136,6 +1136,7 @@ int main(int argc, char** argv) {
                 continue;
             }
             pose_sum_ms += pose_ms;
+            pose_per_person_stats.add(pose_ms);
 
             PoseResult r;
             r.det = det;
@@ -1152,7 +1153,8 @@ int main(int argc, char** argv) {
             results.push_back(std::move(r));
         }
 
-        const float infer_ms = (yolo_ms > 0.0f ? yolo_ms : 0.0f) + pose_sum_ms;
+        const float yolo_infer_ms = (yolo_ms > 0.0f ? yolo_ms : 0.0f);
+        const float rtm_infer_ms = pose_sum_ms;
 
         const auto t3 = Clock::now();
 
@@ -1198,13 +1200,16 @@ int main(int argc, char** argv) {
         const double loop_ms = to_ms(t0, t4);
 
         cap_stats.add(capture_ms);
-        infer_stats.add(infer_ms);
+        yolo_infer_stats.add(yolo_infer_ms);
+        rtm_infer_stats.add(rtm_infer_ms);
+        infer_process_stats.add(infer_process_ms);
         loop_stats.add(loop_ms);
 
         if (args.time_check) {
             std::cout << "capture=" << std::fixed << std::setprecision(1) << capture_ms << " ms,";
             std::cout << "img_process=" << std::fixed << std::setprecision(1) << total_img_ms << " ms,";
-            std::cout << "infer=" << std::fixed << std::setprecision(1) << infer_ms << " ms,";
+            std::cout << "yolo_infer=" << std::fixed << std::setprecision(1) << yolo_infer_ms << " ms,";
+            std::cout << "rtm_infer=" << std::fixed << std::setprecision(1) << rtm_infer_ms << " ms,";
             std::cout << "infer_process=" << std::fixed << std::setprecision(1) << infer_process_ms << " ms,";
             std::cout << "loop=" << std::fixed << std::setprecision(1) << loop_ms << " ms";
             std::cout << " cand_count=" << cand.size();
@@ -1223,8 +1228,14 @@ int main(int argc, char** argv) {
               << "total frame : " << cap_stats.n << "| GUI : " << args.GUI << "\n"
               << "capture_mean=" << std::fixed << std::setprecision(1) << cap_stats.mean
               << " ms, capture_min=" << std::fixed << std::setprecision(1) << cap_stats.min << " ms\n"
-              << "infer_mean=" << std::fixed << std::setprecision(1) << infer_stats.mean
-              << " ms, infer_max=" << std::fixed << std::setprecision(1) << infer_stats.max << " ms\n"
+              << "yolo_infer_mean=" << std::fixed << std::setprecision(1) << yolo_infer_stats.mean
+              << " ms, yolo_infer_max=" << std::fixed << std::setprecision(1) << yolo_infer_stats.max << " ms\n"
+              << "rtm_infer_mean=" << std::fixed << std::setprecision(1) << rtm_infer_stats.mean
+              << " ms, rtm_infer_max=" << std::fixed << std::setprecision(1) << rtm_infer_stats.max << " ms\n"
+              << "infer_process_mean=" << std::fixed << std::setprecision(1) << infer_process_stats.mean
+              << " ms, infer_process_max=" << std::fixed << std::setprecision(1) << infer_process_stats.max << " ms\n"
+              << "pose_per_person_mean=" << std::fixed << std::setprecision(1) << pose_per_person_stats.mean
+              << " ms, pose_per_person_max=" << std::fixed << std::setprecision(1) << pose_per_person_stats.max << " ms\n"
               << "loop_mean=" << std::fixed << std::setprecision(1) << loop_stats.mean
               << " ms, loop_max=" << std::fixed << std::setprecision(1) << loop_stats.max << " ms\n";
 
