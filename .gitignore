@@ -18,8 +18,11 @@ Makefile
 
 # Logs
 *.log
+/log/*
+!/log/.gitkeep
 
 # Editor/OS
 .vscode/
 .idea/
 .DS_Store
+__pycache__/
