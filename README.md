@@ -102,6 +102,16 @@ bash scripts/336L.sh --time
 bash scripts/rtm.sh
 ```
 
+- Realtime debug JSONL 로그 저장 (`main_rtm.cpp`)
+```bash
+bash scripts/rtm.sh --debug --debug_log=./log/rtm_debug.jsonl
+```
+
+- 로그 분석 스크립트 실행
+```bash
+python3 scripts/analyze_realtime_jsonl.py ./log/rtm_debug.jsonl
+```
+
 - 종료
 CTRL+C
 
@@ -113,10 +123,13 @@ CTRL+C
 │  │  └─ .gitkeep
 │  └─ onnx/
 │     └─ yolo11n-pose.onnx
+├─ log/
+│  └─ .gitkeep
 ├─ scripts/
 │  ├─ 2L.sh
 │  ├─ 336L.sh
 │  ├─ rtm.sh
+│  ├─ analyze_realtime_jsonl.py
 │  ├─ build_engine_fp16.sh
 │  ├─ build_project.sh
 │  ├─ build_rtm_engine.sh
@@ -139,3 +152,5 @@ CTRL+C
 ## 참고
 - Orbbec SDK 경로는 CMake에서 /opt/OrbbecSDK_v2.5.5로 고정되어 있습니다.
 - TensorRT 라이브러리는 /usr/lib/aarch64-linux-gnu에서 찾도록 구성되어 있습니다.
+- `scripts/rtm.sh` (main_rtm)에서 `--time`은 `--debug` 활성화 시에만 동작합니다.
+- 디버그 JSONL 로그는 `log/` 디렉토리에 저장하고, git 추적에서 제외합니다.
