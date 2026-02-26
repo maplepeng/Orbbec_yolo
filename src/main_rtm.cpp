@@ -12,6 +12,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstdint>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -51,6 +52,19 @@ static bool startsWith(const std::string& s, const std::string& p) { return s.rf
 static std::string toLower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return s;
+}
+
+static bool parseBoolString(const std::string& s, bool& out) {
+    const std::string v = toLower(s);
+    if (v == "1" || v == "true" || v == "on" || v == "yes") {
+        out = true;
+        return true;
+    }
+    if (v == "0" || v == "false" || v == "off" || v == "no") {
+        out = false;
+        return true;
+    }
+    return false;
 }
 
 struct Spec {
@@ -96,6 +110,8 @@ struct Args {
 
     bool GUI = true;
     bool time_check = false;
+    bool debug = false;
+    std::string debug_log_path = "./log/rtm_debug.jsonl";
 
     bool enable_framesync = true;
     bool enable_d2c_align = true;
@@ -140,7 +156,9 @@ static void printUsage(const char* prog) {
         << "  --max_person=3                        Max persons to run RTMPose\n"
         << "  --person_expand=1.10                  BBox expansion factor for top-down crop\n"
         << "  --no_gui                              Disable GUI\n"
-        << "  --time                                Enable timing logs\n"
+        << "  --time                                Enable per-frame timing logs (requires --debug)\n"
+        << "  --debug[=true|false]                  Enable realtime per-frame metrics logging\n"
+        << "  --debug_log=/path/to/file.jsonl       Realtime metrics JSONL output path\n"
         << "  --no_sync | --no_align | --no_hw_noise\n"
         << "  --hw_noise_thresh=0.2\n"
         << "  --depth_max_mm=4000\n";
@@ -175,6 +193,15 @@ static bool parseArgs(int argc, char** argv, Args& a) {
             a.GUI = false;
         } else if (s == "--time") {
             a.time_check = true;
+        } else if (s == "--debug") {
+            a.debug = true;
+        } else if (startsWith(s, "--debug=")) {
+            if (!parseBoolString(s.substr(8), a.debug)) {
+                std::cerr << "Invalid --debug value: " << s.substr(8) << " (use true/false/1/0)\n";
+                return false;
+            }
+        } else if (startsWith(s, "--debug_log=")) {
+            a.debug_log_path = s.substr(12);
         } else if (s == "--no_sync") {
             a.enable_framesync = false;
         } else if (s == "--no_align") {
@@ -230,6 +257,14 @@ static bool parseArgs(int argc, char** argv, Args& a) {
     a.yolo_kpt_min_count = std::max(0, std::min(17, a.yolo_kpt_min_count));
     a.yolo_edge_kpt_conf_th = clampf(a.yolo_edge_kpt_conf_th, 0.0f, 1.0f);
     a.yolo_edge_kpt_min_count = std::max(0, std::min(5, a.yolo_edge_kpt_min_count));
+    if (!a.debug && a.time_check) {
+        std::cerr << "[WARN] --time is ignored when --debug is false\n";
+        a.time_check = false;
+    }
+    if (a.debug && a.debug_log_path.empty()) {
+        std::cerr << "--debug_log path must not be empty when --debug is enabled\n";
+        return false;
+    }
     return true;
 }
 
@@ -250,6 +285,100 @@ struct RunningStats {
 
     bool hasExtrema() const { return n > 100; }
 };
+
+static uint64_t wallClockNowUs() {
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now).count());
+}
+
+struct CaptureTimestampInfo {
+    uint64_t global_us = 0;
+    uint64_t system_us = 0;
+    uint64_t hardware_us = 0;
+    uint64_t capture_us = 0;
+    uint64_t latency_base_us = 0;
+    std::string source = "host_receive";
+};
+
+static CaptureTimestampInfo collectCaptureTimestampInfo(const std::shared_ptr<ob::Frame>& frame, uint64_t host_receive_us) {
+    CaptureTimestampInfo info;
+
+    try {
+        info.global_us = frame ? frame->getGlobalTimeStampUs() : 0;
+    } catch (...) {
+        info.global_us = 0;
+    }
+    try {
+        info.system_us = frame ? frame->getSystemTimeStampUs() : 0;
+    } catch (...) {
+        info.system_us = 0;
+    }
+    try {
+        info.hardware_us = frame ? frame->getTimeStampUs() : 0;
+    } catch (...) {
+        info.hardware_us = 0;
+    }
+
+    if (info.global_us > 0) {
+        info.source = "global_host";
+        info.capture_us = info.global_us;
+        info.latency_base_us = info.global_us;
+        return info;
+    }
+    if (info.system_us > 0) {
+        info.source = "system_host";
+        info.capture_us = info.system_us;
+        info.latency_base_us = info.system_us;
+        return info;
+    }
+    if (info.hardware_us > 0) {
+        info.source = "hardware_device";
+        info.capture_us = info.hardware_us;
+        info.latency_base_us = host_receive_us;
+        return info;
+    }
+
+    info.source = "host_receive";
+    info.capture_us = host_receive_us;
+    info.latency_base_us = host_receive_us;
+    return info;
+}
+
+static bool tryGetFrameMetadataValue(const std::shared_ptr<ob::Frame>& frame, OBFrameMetadataType type, int64_t& out) {
+    if (!frame) return false;
+    try {
+        if (!frame->hasMetadata(type)) return false;
+        out = frame->getMetadataValue(type);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static const char* syncReferenceToString(int32_t ref) {
+    switch (ref) {
+        case START_OF_EXPOSURE:
+            return "START_OF_EXPOSURE";
+        case MIDDLE_OF_EXPOSURE:
+            return "MIDDLE_OF_EXPOSURE";
+        case END_OF_EXPOSURE:
+            return "END_OF_EXPOSURE";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static double quantileLinear(std::vector<double> v, double q) {
+    if (v.empty()) return std::numeric_limits<double>::quiet_NaN();
+    q = clampf(static_cast<float>(q), 0.0f, 1.0f);
+    std::sort(v.begin(), v.end());
+    const double pos = q * static_cast<double>(v.size() - 1);
+    const size_t lo = static_cast<size_t>(std::floor(pos));
+    const size_t hi = static_cast<size_t>(std::ceil(pos));
+    if (lo == hi) return v[lo];
+    const double frac = pos - static_cast<double>(lo);
+    return v[lo] * (1.0 - frac) + v[hi] * frac;
+}
 
 static cv::Mat decodeMJPGtoBGR(const uint8_t* data, size_t bytes) {
     cv::Mat buf(1, static_cast<int>(bytes), CV_8UC1, const_cast<uint8_t*>(data));
@@ -1109,6 +1238,52 @@ int main(int argc, char** argv) {
     };
 
     RunningStats cap_stats, yolo_infer_stats, rtm_infer_stats, infer_process_stats, pose_per_person_stats, loop_stats;
+    std::ofstream realtime_log;
+    std::vector<double> c_samples_ms;
+    std::vector<double> latency_samples_ms;
+    std::vector<double> aoi_samples_ms;
+    uint64_t prev_stream_frame_id = 0;
+    bool has_prev_stream_frame_id = false;
+    int64_t frame_count = 0;
+    int64_t deadline_miss_count = 0;
+    int64_t total_skip_count = 0;
+    int64_t debug_frame_count = 0;
+    std::vector<uint64_t> deadline_miss_frame_nos;
+    std::vector<uint64_t> deadline_miss_stream_frame_ids;
+    const double deadline_ms = 45.0;
+    int32_t sync_reference = -1;
+    bool sync_reference_valid = false;
+    std::string sync_reference_name = "UNKNOWN";
+
+    if (args.debug) {
+        try {
+            auto dev = pipe->getDevice();
+            if (dev && dev->isPropertySupported(OB_PROP_INTRA_CAMERA_SYNC_REFERENCE_INT, OB_PERMISSION_READ)) {
+                sync_reference = dev->getIntProperty(OB_PROP_INTRA_CAMERA_SYNC_REFERENCE_INT);
+                sync_reference_valid = true;
+                sync_reference_name = syncReferenceToString(sync_reference);
+            }
+        } catch (...) {
+            sync_reference = -1;
+            sync_reference_valid = false;
+            sync_reference_name = "UNKNOWN";
+        }
+    }
+
+    if (args.debug) {
+        realtime_log.open(args.debug_log_path, std::ios::out | std::ios::trunc);
+        if (!realtime_log.is_open()) {
+            std::cerr << "Failed to open debug log file: " << args.debug_log_path << "\n";
+            return 1;
+        }
+        realtime_log << "{\"type\":\"meta\",\"fps\":" << args.color.fps
+                     << ",\"deadline_ms\":" << std::fixed << std::setprecision(3) << deadline_ms
+                     << ",\"sync_reference\":" << (sync_reference_valid ? std::to_string(sync_reference) : "null")
+                     << ",\"sync_reference_name\":\"" << sync_reference_name << "\""
+                     << ",\"log_version\":1}\n";
+        std::cout << "[DEBUG] realtime metrics log: " << args.debug_log_path << "\n";
+    }
+
     CamInternal cam{};
 
     while (!cam.ready) {
@@ -1138,7 +1313,7 @@ int main(int argc, char** argv) {
     }
 
     while (g_running.load()) {
-        const auto t0 = Clock::now();
+        const auto t0 = args.debug ? Clock::now() : Clock::time_point{};
 
         std::shared_ptr<ob::FrameSet> fs;
         try {
@@ -1152,8 +1327,25 @@ int main(int argc, char** argv) {
         auto c = fs->colorFrame();
         auto d = fs->depthFrame();
         if (!c || !d) continue;
+        const uint64_t stream_frame_id = c->getIndex();
+        const uint64_t frame_no = static_cast<uint64_t>(frame_count + 1);
 
-        const auto t1 = Clock::now();
+        const auto t1 = args.debug ? Clock::now() : Clock::time_point{};
+        uint64_t t_start_process_us = 0;
+        uint64_t t_capture_us = 0;
+        uint64_t t_capture_for_latency_us = 0;
+        std::string capture_ts_source;
+        CaptureTimestampInfo capture_ts_info{};
+        int64_t exposure_value = 0;
+        bool has_exposure = false;
+        if (args.debug) {
+            t_start_process_us = wallClockNowUs();
+            capture_ts_info = collectCaptureTimestampInfo(c, t_start_process_us);
+            t_capture_us = capture_ts_info.capture_us;
+            t_capture_for_latency_us = capture_ts_info.latency_base_us;
+            capture_ts_source = capture_ts_info.source;
+            has_exposure = tryGetFrameMetadataValue(c, OB_FRAME_METADATA_TYPE_EXPOSURE, exposure_value);
+        }
 
         cv::Mat color_bgr = colorFrameToBGR(c);
         cv::Mat depth16 = depthFrameToMat16U(d);
@@ -1162,9 +1354,7 @@ int main(int argc, char** argv) {
         rotateIfNeeded(color_bgr, args.rotate);
         rotateIfNeeded(depth16, args.rotate);
 
-        cv::Mat depth_cm = depthToColorMap(depth16, args.depth_max_mm);
-
-        const auto t2 = Clock::now();
+        const auto t2 = args.debug ? Clock::now() : Clock::time_point{};
 
         LetterBoxInfo yolo_lb{};
         const float yolo_ms = yolo_runner.inferLetterbox(color_bgr, yolo_lb);
@@ -1270,8 +1460,7 @@ int main(int argc, char** argv) {
 
         const float yolo_infer_ms = (yolo_ms > 0.0f ? yolo_ms : 0.0f);
         const float rtm_infer_ms = pose_sum_ms;
-
-        const auto t3 = Clock::now();
+        const auto t3 = args.debug ? Clock::now() : Clock::time_point{};
 
         if (!results.empty()) {
             const auto& r0 = results.front();
@@ -1294,8 +1483,11 @@ int main(int argc, char** argv) {
             }
         }
 
+        const uint64_t t_end_process_us = args.debug ? wallClockNowUs() : 0;
+
         int key = -1;
         if (args.GUI) {
+            cv::Mat depth_cm = depthToColorMap(depth16, args.depth_max_mm);
             cv::Mat vis = color_bgr.clone();
             drawPose(vis, results, yolo_only, args.kpt_th, args.yolo_kpt_conf_th);
             cv::imshow("color_pose_rtm", vis);
@@ -1307,59 +1499,198 @@ int main(int argc, char** argv) {
 
         if (key == 27 || key == 'q') g_running.store(false);
 
-        const auto t4 = Clock::now();
+        const auto t4 = args.debug ? Clock::now() : Clock::time_point{};
+        const uint64_t t_output_us = args.debug ? wallClockNowUs() : 0;
+        ++frame_count;
 
-        const double capture_ms = to_ms(t0, t1);
-        const double total_img_ms = to_ms(t0, t2);
-        const double infer_process_ms = to_ms(t2, t3);
-        const double loop_ms = to_ms(t0, t4);
+        uint64_t frame_gap = 0;
+        int64_t skip = 0;
+        if (has_prev_stream_frame_id && stream_frame_id > prev_stream_frame_id) {
+            frame_gap = stream_frame_id - prev_stream_frame_id;
+            if (frame_gap > 1) {
+                skip = static_cast<int64_t>(frame_gap - 1);
+                std::cerr << "[WARN][SKIP] frame_no=" << frame_no
+                          << " stream_frame_id prev=" << prev_stream_frame_id
+                          << " curr=" << stream_frame_id
+                          << " gap=" << frame_gap
+                          << " skip=" << skip << "\n";
+            }
+        }
+        prev_stream_frame_id = stream_frame_id;
+        has_prev_stream_frame_id = true;
 
-        cap_stats.add(capture_ms);
-        yolo_infer_stats.add(yolo_infer_ms);
-        rtm_infer_stats.add(rtm_infer_ms);
-        infer_process_stats.add(infer_process_ms);
-        loop_stats.add(loop_ms);
+        if (args.debug) {
+            const double capture_ms = to_ms(t0, t1);
+            const double total_img_ms = to_ms(t0, t2);
+            const double infer_process_ms = to_ms(t2, t3);
+            const double loop_ms = to_ms(t0, t4);
 
-        if (args.time_check) {
-            std::cout << "capture=" << std::fixed << std::setprecision(1) << capture_ms << " ms,";
-            std::cout << "img_process=" << std::fixed << std::setprecision(1) << total_img_ms << " ms,";
-            std::cout << "yolo_infer=" << std::fixed << std::setprecision(1) << yolo_infer_ms << " ms,";
-            std::cout << "rtm_infer=" << std::fixed << std::setprecision(1) << rtm_infer_ms << " ms,";
-            std::cout << "infer_process=" << std::fixed << std::setprecision(1) << infer_process_ms << " ms,";
-            std::cout << "loop=" << std::fixed << std::setprecision(1) << loop_ms << " ms";
-            std::cout << " cand_count=" << cand.size();
-            std::cout << " yolo_count=" << keep.size();
-            std::cout << " pose_input_count=" << pose_inputs.size();
-            std::cout << " yolo_only_count=" << yolo_only.size();
-            std::cout << " pose_count=" << results.size() << "\n";
+            cap_stats.add(capture_ms);
+            yolo_infer_stats.add(yolo_infer_ms);
+            rtm_infer_stats.add(rtm_infer_ms);
+            infer_process_stats.add(infer_process_ms);
+            loop_stats.add(loop_ms);
+
+            if (args.time_check) {
+                std::cout << "capture=" << std::fixed << std::setprecision(1) << capture_ms << " ms,";
+                std::cout << "img_process=" << std::fixed << std::setprecision(1) << total_img_ms << " ms,";
+                std::cout << "yolo_infer=" << std::fixed << std::setprecision(1) << yolo_infer_ms << " ms,";
+                std::cout << "rtm_infer=" << std::fixed << std::setprecision(1) << rtm_infer_ms << " ms,";
+                std::cout << "infer_process=" << std::fixed << std::setprecision(1) << infer_process_ms << " ms,";
+                std::cout << "loop=" << std::fixed << std::setprecision(1) << loop_ms << " ms";
+                std::cout << " cand_count=" << cand.size();
+                std::cout << " yolo_count=" << keep.size();
+                std::cout << " pose_input_count=" << pose_inputs.size();
+                std::cout << " yolo_only_count=" << yolo_only.size();
+                std::cout << " pose_count=" << results.size() << "\n";
+            }
+        }
+
+        if (args.debug) {
+            const double c_ms = static_cast<double>(t_end_process_us - t_start_process_us) / 1000.0;
+            const double latency_ms =
+                (t_output_us >= t_capture_for_latency_us)
+                    ? (static_cast<double>(t_output_us - t_capture_for_latency_us) / 1000.0)
+                    : 0.0;
+            const double aoi_ms = latency_ms;
+
+            const bool deadline_miss = (deadline_ms > 0.0) && (latency_ms > deadline_ms);
+
+            c_samples_ms.push_back(c_ms);
+            latency_samples_ms.push_back(latency_ms);
+            aoi_samples_ms.push_back(aoi_ms);
+            total_skip_count += skip;
+            deadline_miss_count += deadline_miss ? 1 : 0;
+            if (deadline_miss) {
+                deadline_miss_frame_nos.push_back(frame_no);
+                deadline_miss_stream_frame_ids.push_back(stream_frame_id);
+            }
+            ++debug_frame_count;
+
+            realtime_log << "{\"type\":\"frame\",\"frame_no\":" << frame_no
+                         << ",\"frame_id\":" << stream_frame_id
+                         << ",\"t_capture_us\":" << t_capture_us
+                         << ",\"t_capture_source\":\"" << capture_ts_source << "\""
+                         << ",\"system_ts_us\":" << capture_ts_info.system_us
+                         << ",\"global_ts_us\":" << capture_ts_info.global_us
+                         << ",\"sync_reference\":" << (sync_reference_valid ? std::to_string(sync_reference) : "null")
+                         << ",\"sync_reference_name\":\"" << sync_reference_name << "\""
+                         << ",\"exposure\":" << (has_exposure ? std::to_string(exposure_value) : "null")
+                         << ",\"t_capture_for_latency_us\":" << t_capture_for_latency_us
+                         << ",\"t_start_process_us\":" << t_start_process_us
+                         << ",\"t_end_process_us\":" << t_end_process_us
+                         << ",\"t_output_us\":" << t_output_us
+                         << ",\"C_ms\":" << std::fixed << std::setprecision(3) << c_ms
+                         << ",\"latency_ms\":" << latency_ms
+                         << ",\"aoi_ms\":" << aoi_ms
+                         << ",\"deadline_ms\":" << deadline_ms
+                         << ",\"deadline_miss\":" << (deadline_miss ? "true" : "false")
+                         << ",\"skip\":" << skip
+                         << ",\"frame_gap\":" << frame_gap
+                         << ",\"cand_count\":" << cand.size()
+                         << ",\"yolo_count\":" << keep.size()
+                         << ",\"pose_input_count\":" << pose_inputs.size()
+                         << ",\"yolo_only_count\":" << yolo_only.size()
+                         << ",\"pose_count\":" << results.size()
+                         << "}\n";
+            if ((debug_frame_count % 30) == 0) {
+                realtime_log.flush();
+            }
         }
     }
 
-    if (cap_stats.n <= 100) {
-        std::cout << "\nMax and Min values are calculated after the 100th frame.";
+    if (args.debug) {
+        if (cap_stats.n <= 100) {
+            std::cout << "\nMax and Min values are calculated after the 100th frame.";
+        }
+
+        auto formatExtrema = [](const RunningStats& s, bool want_min) -> std::string {
+            if (!s.hasExtrema()) return "N/A";
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(1) << (want_min ? s.min : s.max);
+            return oss.str();
+        };
+
+        std::cout << "\n= SUMMARY =\n"
+                  << "total frame : " << cap_stats.n << "| GUI : " << args.GUI << "\n"
+                  << "capture_mean=" << std::fixed << std::setprecision(1) << cap_stats.mean
+                  << " ms, capture_min=" << formatExtrema(cap_stats, true) << " ms\n"
+                  << "yolo_infer_mean=" << std::fixed << std::setprecision(1) << yolo_infer_stats.mean
+                  << " ms, yolo_infer_max=" << formatExtrema(yolo_infer_stats, false) << " ms\n"
+                  << "rtm_infer_mean=" << std::fixed << std::setprecision(1) << rtm_infer_stats.mean
+                  << " ms, rtm_infer_max=" << formatExtrema(rtm_infer_stats, false) << " ms\n"
+                  << "infer_process_mean=" << std::fixed << std::setprecision(1) << infer_process_stats.mean
+                  << " ms, infer_process_max=" << formatExtrema(infer_process_stats, false) << " ms\n"
+                  << "pose_per_person_mean=" << std::fixed << std::setprecision(1) << pose_per_person_stats.mean
+                  << " ms, pose_per_person_max=" << formatExtrema(pose_per_person_stats, false) << " ms\n"
+                  << "loop_mean=" << std::fixed << std::setprecision(1) << loop_stats.mean
+                  << " ms, loop_max=" << formatExtrema(loop_stats, false) << " ms\n";
+
+        if (realtime_log.is_open()) {
+            realtime_log.flush();
+            realtime_log.close();
+        }
+
+        const auto fmt_ms = [](double v) -> std::string {
+            if (!std::isfinite(v)) return "N/A";
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(3) << v;
+            return oss.str();
+        };
+
+        const double miss_ratio = (debug_frame_count > 0)
+                                      ? (100.0 * static_cast<double>(deadline_miss_count) / static_cast<double>(debug_frame_count))
+                                      : 0.0;
+
+        std::cout << "\n= REALTIME DEBUG SUMMARY =\n"
+                  << "debug_log_path=" << args.debug_log_path << "\n"
+                  << "frames_logged=" << debug_frame_count << "\n"
+                  << "deadline_ms=" << fmt_ms(deadline_ms)
+                  << ", deadline_miss_count=" << deadline_miss_count
+                  << ", deadline_miss_ratio=" << fmt_ms(miss_ratio) << " %\n"
+                  << "skip_total=" << total_skip_count << "\n"
+                  << "C_ms_p50=" << fmt_ms(quantileLinear(c_samples_ms, 0.50))
+                  << ", C_ms_p90=" << fmt_ms(quantileLinear(c_samples_ms, 0.90))
+                  << ", C_ms_p99=" << fmt_ms(quantileLinear(c_samples_ms, 0.99)) << "\n"
+                  << "latency_ms_p50=" << fmt_ms(quantileLinear(latency_samples_ms, 0.50))
+                  << ", latency_ms_p90=" << fmt_ms(quantileLinear(latency_samples_ms, 0.90))
+                  << ", latency_ms_p99=" << fmt_ms(quantileLinear(latency_samples_ms, 0.99)) << "\n"
+                  << "AoI_ms_p50=" << fmt_ms(quantileLinear(aoi_samples_ms, 0.50))
+                  << ", AoI_ms_p90=" << fmt_ms(quantileLinear(aoi_samples_ms, 0.90))
+                  << ", AoI_ms_p99=" << fmt_ms(quantileLinear(aoi_samples_ms, 0.99)) << "\n";
+
+        auto printCompactList = [](const char* label, const std::vector<uint64_t>& ids) {
+            std::cout << label << "=";
+            if (ids.empty()) {
+                std::cout << "[]\n";
+                return;
+            }
+            const size_t total_ids = ids.size();
+            std::cout << "[";
+            if (total_ids <= 40) {
+                for (size_t i = 0; i < total_ids; ++i) {
+                    if (i > 0) std::cout << ",";
+                    std::cout << ids[i];
+                }
+            } else {
+                for (size_t i = 0; i < 20; ++i) {
+                    if (i > 0) std::cout << ",";
+                    std::cout << ids[i];
+                }
+                std::cout << ",...,";
+                for (size_t i = total_ids - 20; i < total_ids; ++i) {
+                    if (i > total_ids - 20) std::cout << ",";
+                    std::cout << ids[i];
+                }
+            }
+            std::cout << "] (total=" << total_ids << ")\n";
+        };
+        printCompactList("deadline_miss_frame_no", deadline_miss_frame_nos);
+        printCompactList("deadline_miss_stream_frame_id", deadline_miss_stream_frame_ids);
+    } else {
+        std::cout << "\n= SUMMARY =\n"
+                  << "total frame : " << frame_count << "| GUI : " << args.GUI << "\n";
     }
-
-    auto formatExtrema = [](const RunningStats& s, bool want_min) -> std::string {
-        if (!s.hasExtrema()) return "N/A";
-        std::ostringstream oss;
-        oss << std::fixed << std::setprecision(1) << (want_min ? s.min : s.max);
-        return oss.str();
-    };
-
-    std::cout << "\n= SUMMARY =\n"
-              << "total frame : " << cap_stats.n << "| GUI : " << args.GUI << "\n"
-              << "capture_mean=" << std::fixed << std::setprecision(1) << cap_stats.mean
-              << " ms, capture_min=" << formatExtrema(cap_stats, true) << " ms\n"
-              << "yolo_infer_mean=" << std::fixed << std::setprecision(1) << yolo_infer_stats.mean
-              << " ms, yolo_infer_max=" << formatExtrema(yolo_infer_stats, false) << " ms\n"
-              << "rtm_infer_mean=" << std::fixed << std::setprecision(1) << rtm_infer_stats.mean
-              << " ms, rtm_infer_max=" << formatExtrema(rtm_infer_stats, false) << " ms\n"
-              << "infer_process_mean=" << std::fixed << std::setprecision(1) << infer_process_stats.mean
-              << " ms, infer_process_max=" << formatExtrema(infer_process_stats, false) << " ms\n"
-              << "pose_per_person_mean=" << std::fixed << std::setprecision(1) << pose_per_person_stats.mean
-              << " ms, pose_per_person_max=" << formatExtrema(pose_per_person_stats, false) << " ms\n"
-              << "loop_mean=" << std::fixed << std::setprecision(1) << loop_stats.mean
-              << " ms, loop_max=" << formatExtrema(loop_stats, false) << " ms\n";
 
     try {
         pipe->stop();
